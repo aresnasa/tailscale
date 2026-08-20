@@ -70,7 +70,13 @@ type endpoint struct {
 	fakeWGAddr   netip.AddrPort // the UDP address we tell wireguard-go we're using
 	nodeAddr     netip.Addr     // the node's first tailscale address; used for logging & wireguard rate-limiting (Issue 6686)
 
+	// disco describes if the peer supports disco, the key and short string.
+	// The field MUST not be changed directly, but should be updated through
+	// [updateDiscoKey] and [updateTSMPDiscoKey]. Loading the struct without
+	// editing is expected behaviour.
 	disco atomic.Pointer[endpointDisco] // if the peer supports disco, the key and short string
+
+	discoChangedForPeer func(key.NodePublic) // callback for when a peer changes its active disco key
 
 	// mu protects all following fields.
 	mu syncs.Mutex // Lock ordering: Conn.mu, then endpoint.mu
@@ -373,8 +379,7 @@ func (de *endpoint) setProbeUDPLifetimeConfigLocked(desired *ProbeUDPLifetimeCon
 
 // endpointDisco is the current disco key and short string for an endpoint for
 // keys learned both from controlClient and via TSMP. Only one key is active at
-// a time for sending. Currently the controlClient learned key is always
-// considered active as TSMP writes keys through this route.
+// a time for sending.
 //
 // This structure is immutable.
 type endpointDisco struct {
@@ -409,6 +414,15 @@ func (e *endpointDisco) keyFromTSMP() key.DiscoPublic {
 		return key.DiscoPublic{}
 	}
 	return e.tsmpKey
+}
+
+// tsmpIsActive reports whether the TSMP learned key is currently the active
+// disco key. Safe to call on a nil receiver (returns false).
+func (e *endpointDisco) tsmpIsActive() bool {
+	if e == nil {
+		return false
+	}
+	return e.tsmpActive
 }
 
 // shortString returns the ShortString of the key currently regarded as active
@@ -1535,13 +1549,17 @@ func (de *endpoint) updateDiscoKey(key key.DiscoPublic) {
 		if !key.IsZero() {
 			epDisco.controlKey = key
 			epDisco.controlShort = key.ShortString()
-			epDisco.tsmpActive = false
+			epDisco.tsmpActive = false // TODO(cmol): Set conditional when routing TSMP through magicsock.
 		}
 		// We have no key material, nil out key.
 		if epDisco.controlKey.IsZero() && epDisco.tsmpKey.IsZero() {
 			epDisco = nil
 		}
 		if de.disco.CompareAndSwap(old, epDisco) {
+			if old.tsmpIsActive() != epDisco.tsmpIsActive() ||
+				(!epDisco.tsmpIsActive() && old.keyFromControl() != epDisco.keyFromControl()) {
+				de.changedActiveDisco()
+			}
 			return
 		}
 	}
@@ -1573,10 +1591,74 @@ func (de *endpoint) updateTSMPDiscoKey(key key.DiscoPublic) {
 			epDisco = nil
 		}
 		if de.disco.CompareAndSwap(old, epDisco) {
-			// Fall out of the loop if the swap was successful (no change was made
-			// since the load).
-			break
+			if old.tsmpIsActive() != epDisco.tsmpIsActive() ||
+				(epDisco.tsmpIsActive() && old.keyFromTSMP() != epDisco.keyFromTSMP()) {
+				de.changedActiveDisco()
+			}
+			return
 		}
+	}
+}
+
+var sawDiscoKeyTestHook func()
+
+// sawDiscoKey takes a [key.DiscoPublic] and returns the current [endpointDisco]
+// struct (could be nil) and if the key was known.
+//
+// As a side effect, if the active key was not the one seen on the wire, swap
+// what key is active. If the active is swapped, the returned [endpointDisco]
+// will be the newly saved version.
+func (de *endpoint) sawDiscoKey(seen key.DiscoPublic) (*endpointDisco, bool) {
+	epDisco := &endpointDisco{}
+	for {
+		current := de.disco.Load()
+		if current == nil {
+			return current, false
+		}
+
+		if !current.key().IsZero() && current.key() == seen {
+			return current, true
+		}
+
+		var inactiveKey key.DiscoPublic
+		if current.tsmpActive {
+			inactiveKey = current.keyFromControl()
+		} else {
+			inactiveKey = current.keyFromTSMP()
+		}
+
+		// We have seen the inactive key, swap to that one as being active.
+		if !inactiveKey.IsZero() && inactiveKey == seen {
+			if sawDiscoKeyTestHook != nil {
+				sawDiscoKeyTestHook()
+			}
+			epDisco.controlKey = current.controlKey
+			epDisco.controlShort = current.controlShort
+			epDisco.tsmpKey = current.tsmpKey
+			epDisco.tsmpShort = current.tsmpShort
+			epDisco.tsmpActive = !current.tsmpActive
+			if de.disco.CompareAndSwap(current, epDisco) {
+				de.changedActiveDisco()
+				return epDisco, true
+			} else {
+				// The struct changed under us, run the search again.
+				continue
+			}
+		}
+		return current, false
+	}
+}
+
+// changedActiveDisco invalidates the current disco path for a re-probe, but
+// keeps the bestAddr so data keeps flowing until a new path is confirmed.
+// Additionally, it signals to the engine, that the wireguard should schedule
+// a handshake on next user send, to ensure the wireguard connection is active,
+// to make restarting nodes recover an active connection faster.
+func (de *endpoint) changedActiveDisco() {
+	de.trustBestAddrUntil = 0
+	de.invalidateDiscoPathLocked()
+	if de.discoChangedForPeer != nil {
+		de.discoChangedForPeer(de.publicKey)
 	}
 }
 
@@ -1608,11 +1690,6 @@ func (de *endpoint) updateFromNode(n tailcfg.NodeView, heartbeatDisabled bool, p
 			When: time.Now(),
 			What: "updateFromNode-disco-key-changed",
 		})
-		// The peer rotated its disco key, so any path we currently trust to it is stale.
-		// Invalidate path discovery state so we re-probe, but keep bestAddr so data
-		// keeps flowing until a fresh path is confirmed.
-		de.trustBestAddrUntil = 0
-		de.invalidateDiscoPathLocked()
 	}
 	if n.HomeDERP() == 0 {
 		if de.derpAddr.IsValid() {
@@ -2186,7 +2263,9 @@ func (de *endpoint) invalidateDiscoPathLocked() {
 		}
 	}
 	de.probeUDPLifetime.resetCycleEndpointLocked()
-	de.c.relayManager.stopWork(de)
+	if de.c != nil {
+		de.c.relayManager.stopWork(de)
+	}
 }
 
 func (de *endpoint) numStopAndReset() int64 {

@@ -2374,12 +2374,12 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			c.logf("magicsock: disco: ignoring %s from %v; %v is not known to be relay capable", msgType, sender.ShortString(), sender.ShortString())
 			return
 		}
-		epDisco := ep.disco.Load()
+
+		epDisco, sawKey := ep.sawDiscoKey(di.discoKey)
 		if epDisco == nil {
 			return
 		}
-		// TODO(cmol): Switch active keys based on what we see here
-		if epDisco.key() != di.discoKey {
+		if !sawKey {
 			if isVia {
 				metricRecvDiscoCallMeMaybeViaBadDisco.Add(1)
 			} else {
@@ -2440,12 +2440,12 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 			c.logf("magicsock: disco: ignoring %s from %v; %v is unknown", msgType, sender.ShortString(), derpNodeSrc.ShortString())
 			return
 		}
-		epDisco := ep.disco.Load()
+
+		epDisco, sawKey := ep.sawDiscoKey(di.discoKey)
 		if epDisco == nil {
 			return
 		}
-		// TODO(cmol): Switch active keys based on what we see here
-		if epDisco.key() != di.discoKey {
+		if !sawKey {
 			if isResp {
 				metricRecvDiscoAllocUDPRelayEndpointResponseBadDisco.Add(1)
 			} else {
@@ -2509,10 +2509,8 @@ func (c *Conn) handleDiscoMessage(msg []byte, src epAddr, shouldBeRelayHandshake
 // c.mu must be held.
 func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic, derpNodeSrc key.NodePublic) (nk key.NodePublic, ok bool) {
 	if !derpNodeSrc.IsZero() {
-		// TODO(cmol): Switch active keys based on what we see here
 		if ep, ok := c.peerMap.endpointForNodeKey(derpNodeSrc); ok {
-			epDisco := ep.disco.Load()
-			if epDisco != nil && epDisco.key() == dk {
+			if _, sawKey := ep.sawDiscoKey(dk); !sawKey {
 				return derpNodeSrc, true
 			}
 		}
@@ -2521,9 +2519,7 @@ func (c *Conn) unambiguousNodeKeyOfPingLocked(dm *disco.Ping, dk key.DiscoPublic
 	// Pings after 1.16.0 contains its node source. See if it maps back.
 	if !dm.NodeKey.IsZero() {
 		if ep, ok := c.peerMap.endpointForNodeKey(dm.NodeKey); ok {
-			epDisco := ep.disco.Load()
-			// TODO(cmol): Switch active keys based on what we see here
-			if epDisco != nil && epDisco.key() == dk {
+			if _, sawKey := ep.sawDiscoKey(dk); !sawKey {
 				return dm.NodeKey, true
 			}
 		}
