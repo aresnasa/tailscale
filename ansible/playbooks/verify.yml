@@ -1,10 +1,11 @@
 ---
-# 快速连通验证：tailscale version/status + 两节点互 ping
+# 快速连通验证：tailscale status + 两机互 ping + 217 经 Mac 访问 GitHub
 # 用法: ansible-playbook playbooks/verify.yml -K
 
 - name: 收集两节点的 tailscale 状态
   hosts: all
   become: true
+  gather_facts: false
   tasks:
     - name: tailscale status
       ansible.builtin.command:
@@ -20,9 +21,11 @@
       changed_when: false
       failed_when: false
 
-    - name: 输出状态
+    - name: 输出状态与出口节点信息
       ansible.builtin.debug:
-        msg: "{{ ts_status.stdout_lines }}"
+        msg:
+          - "===== {{ inventory_hostname }} status ====="
+          - "{{ ts_status.stdout_lines }}"
 
 - name: 从 mac 向远端 ping（验证两机 mesh 连通）
   hosts: local
@@ -39,3 +42,29 @@
     - name: ping 结果
       ansible.builtin.debug:
         msg: "{{ ping_result.stdout_lines | default(['ping 失败，确认两端已 tailscale up']) }}"
+
+- name: 验证 217 经 Mac 出口节点访问 GitHub
+  hosts: remote
+  become: true
+  gather_facts: false
+  tasks:
+    - name: curl GitHub（流量应经 exit node=mac-mini 转发）
+      ansible.builtin.command:
+        cmd: curl -sS -o /dev/null -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s\n' https://github.com
+      register: gh
+      changed_when: false
+      failed_when: false
+
+    - name: 查看当前出口节点
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status --json"
+      register: st_json
+      changed_when: false
+      failed_when: false
+
+    - name: 输出 GitHub 访问结果
+      ansible.builtin.debug:
+        msg:
+          - "217 -> github.com: {{ gh.stdout | default(gh.stderr) }}"
+          - "（若 HTTP 200 且 remote_ip 是公网地址，说明已成功经 Mac 出网）"
+          - "若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。"

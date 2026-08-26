@@ -2,10 +2,13 @@
 
 在**本机 macOS** 上作为 Ansible 控制节点，向两台目标机部署 headless 版 `tailscaled` + `tailscale`：
 
-| 节点 | 地址 | 平台 | 二进制产物 | 守护方式 |
-| --- | --- | --- | --- | --- |
-| mac-mini（本机） | localhost | darwin/arm64 | `dist/*-darwin-arm64` | launchd (`com.tailscale.tailscaled`) |
-| box-217（远端） | 10.9.202.217 (root) | linux/amd64 | `dist/*-linux-amd64` | systemd (`tailscaled.service`) |
+| 节点 | 地址 | 角色 | 平台 | 二进制产物 | 守护方式 |
+| --- | --- | --- | --- | --- | --- |
+| mac-mini（本机） | localhost | **exit node**（出口网关） | darwin/arm64 | `dist/*-darwin-arm64` | launchd (`com.tailscale.tailscaled`) |
+| box-217（远端） | 10.9.202.217 (root) | **exit node client**（经 Mac 出网） | linux/amd64 | `dist/*-linux-amd64` | systemd (`tailscaled.service`) |
+
+拓扑意图：217 的出网流量（含访问 GitHub）经 Tailscale 隧道送到 Mac，由 Mac 转发到公网。
+Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` 指向它。
 
 ## 前置条件
 
@@ -29,15 +32,31 @@
 以下命令都在 `ansible/` 目录下执行，`-K` 会提示输入 Mac 本机 sudo 密码：
 
 ```sh
-# 1. 全量：构建 -> 部署 -> 验证（两机）
+# 1. 全量：构建 -> 部署 -> up（Mac 先广播 exit node，217 再引用）-> 验证
 ./.venv/bin/ansible-playbook playbooks/deploy.yml -K
 
-# 2. 带 auth key 一键 tailscale up 加入 tailnet（真正打通两机互访）
+# 2. 带 auth key 一键 tailscale up（真正打通两机 + 出口路由）
 ./.venv/bin/ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-auth-xxxxxxxx
 
 # 3. 随时验证两机状态 & mac -> box-217 ping
 ./.venv/bin/ansible-playbook playbooks/verify.yml
 ```
+
+### 出口节点（exit node）注意事项
+
+- **Mac 侧无需手动 sysctl / pf**：tailscaled-on-macOS 默认用 `utun` 且子网/出口转发走
+  netstack 用户态并自带 NAT（源码 `cmd/tailscaled` 的 `handleSubnetsInNetstack`
+  在 darwin 返回 true）。launchd plist 已以 root 运行，满足 `utun` 权限。
+- **exit node 必须在管理后台一次性审批**：Tailscale 没有为 exit node 提供 ACL
+  授权属性（源码确认仅有 `funnel`/`ssh-aggregator` 等），所以 Mac `up --advertise-exit-node`
+  后，需到 [管理后台](https://login.tailscale.com/admin/machines) → mac-mini →
+  *Edit route settings* → 勾选 *Use as exit node* → Save。217 的 `--exit-node=mac-mini`
+  在审批完成前会失败，playbook 会打印提示；审批后重跑 `--tags up` 即可。
+- **路由全部流量**：`--exit-node` 会把 217 的全部出网流量经 Mac 转发（含 GitHub）。
+  若只想放行 GitHub 而保留其余直连，Tailscale 原生不支持按域名分流出口；可改为在 Mac
+  上用子网路由 + 217 侧 `--accept-routes`，但 GitHub IP 段多变，不推荐。测试场景用
+  exit node 最简单。
+- 若 Mac 上装过 Tailscale GUI 客户端，**先退出它**，避免抢占 UDP 41641 / utun。
 
 常用子集：
 

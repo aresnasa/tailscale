@@ -15,8 +15,16 @@ ts_dist_dir: "{{ playbook_dir }}/../../dist"
 #   ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-auth-xxx
 ts_authkey: ""
 
-# 追加给 tailscale up 的额外参数（如 --advertise-exit-node）
+# 追加给 tailscale up 的额外参数（如 --advertise-exit-node 之外的需求）
 ts_up_extra_args: ""
+
+# ---- 出口节点（exit node）拓扑 ----
+# 由清单里的 ts_role 驱动 deploy.yml 的 up 任务：
+#   exit-node         -> tailscale up --advertise-exit-node（本机做网关）
+#   exit-node-client  -> tailscale up --exit-node={{ ts_exit_node }}
+#   (未设置)          -> 普通 tailscale up
+# exit-node-client 引用的对端 tailscale 主机名（默认即 mac-mini）
+ts_exit_node: "mac-mini"
 
 # ---- 控制面管理（playbooks/control.yml：ACL + 用户）----
 # Tailscale API 访问令牌（Settings > Keys 生成 tskey-api-...）。

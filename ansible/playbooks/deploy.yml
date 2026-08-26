@@ -52,6 +52,7 @@
 - name: 分发并安装 tailscaled/tailscale
   hosts: all
   become: true
+  gather_facts: false
   # mac 走 launchd、linux 走 systemd，由清单里的 ts_platform 区分
   tags: [deploy]
   tasks:
@@ -132,25 +133,67 @@
       when: ts_platform == 'linux'
       listen: 重启 tailscaled
 
-- name: 可选：tailscale up 加入 tailnet（提供 ts_authkey 时）
+- name: 计算各节点的 tailscale up 命令（按 ts_role）
   hosts: all
-  become: true
+  gather_facts: false
   tags: [up]
   tasks:
-    - name: tailscale up
-      ansible.builtin.command:
-        cmd: >-
+    - name: 拼装 up 命令
+      ansible.builtin.set_fact:
+        ts_up_cmd: >-
           {{ ts_install_dir }}/tailscale --socket={{ ts_socket }} up
-          --auth-key={{ ts_authkey }} --hostname={{ inventory_hostname }}
+          --hostname={{ inventory_hostname }}
+          {% if ts_role == 'exit-node' %}--advertise-exit-node
+          {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes
+          {% endif %}
           {{ ts_up_extra_args }}
-      register: up_result
+
+    - name: 预览将执行的 up 命令（未提供 authkey 时仅展示，便于人工执行）
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} [{{ ts_role | default('default') }}]: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}"
+
+- name: 可选：出口节点先 up（Mac 广播 exit node）
+  hosts: local
+  become: true
+  gather_facts: false
+  tags: [up]
+  tasks:
+    - name: tailscale up --advertise-exit-node（Mac）
+      ansible.builtin.command:
+        cmd: "{{ ts_up_cmd }} --auth-key={{ ts_authkey }}"
+      register: up_mac
       changed_when: true
-      failed_when: up_result.rc != 0
       when: ts_authkey | length > 0
+
+- name: 可选：客户端 up 并指向 Mac 作为 exit node
+  hosts: remote
+  become: true
+  gather_facts: false
+  tags: [up]
+  tasks:
+    - name: tailscale up --exit-node（217）
+      ansible.builtin.command:
+        cmd: "{{ ts_up_cmd }} --auth-key={{ ts_authkey }}"
+      register: up_client
+      changed_when: true
+      failed_when: false
+      when: ts_authkey | length > 0
+
+    - name: 若客户端 up 失败，提示去管理后台审批 Mac 的 exit node
+      ansible.builtin.debug:
+        msg:
+          - "217 up 返回 rc={{ up_client.rc | default('skipped') }}"
+          - "{{ up_client.stdout_lines | default([]) }}"
+          - "{{ up_client.stderr_lines | default([]) }}"
+          - ">> 若提示 exit node 不可用：请到 Tailscale 管理后台 Machines → mac-mini → Edit route settings，"
+          - "   勾选 'Use as exit node' 并 Save（exit node 无 ACL 属性，必须后台一次性审批），随后重跑："
+          - "   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up"
+      when: (ts_authkey | length > 0) and (up_client.rc | default(1) != 0)
 
 - name: 验证 daemon 与 CLI 连通
   hosts: all
   become: true
+  gather_facts: false
   tags: [verify]
   tasks:
     - name: tailscale version / status
