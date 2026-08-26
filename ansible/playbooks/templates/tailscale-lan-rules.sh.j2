@@ -1,0 +1,81 @@
+#!/bin/sh
+# tailscale-lan-rules.sh — 管理"内网网段绕过 Tailscale table 52"的 ip rule 规则
+#
+# 问题背景:
+#   tailscale up --exit-node 后，Tailscale 在 ip rule 里加 5270: from all lookup 52,
+#   在 table 52 里写 default dev tailscale0（exit node 路由补集）。
+#   --ignore-routes 让出方向 10.x 不走 table 52，但入方向回包（目的地在内网段）
+#   仍会命中 table 52 的 throw 或 default，导致连接进得来、回不去。
+#
+# 解法:
+#   在 5270 之前（priority 5260）插入 to <CIDR> lookup main 规则,
+#   让目标在内网段的流量直接查 main 表，绕过 table 52。
+#
+# CIDR 列表从 /etc/tailscale/lan-routes.conf 读取（一行一个）。
+# 该文件由 Ansible 的 lan-access.yml 生成。
+#
+# 用法:
+#   tailscale-lan-rules.sh up     # 添加规则
+#   tailscale-lan-rules.sh down   # 删除规则
+#   tailscale-lan-rules.sh status # 查看规则
+
+set -eu
+
+RULE_FILE="/etc/tailscale/lan-routes.conf"
+PRIORITY=5260
+
+if [ -f "$RULE_FILE" ]; then
+    CIDRS=$(grep -v '^[[:space:]]*#' "$RULE_FILE" | grep -v '^[[:space:]]*$' || true)
+else
+    CIDRS=""
+fi
+
+cmd="${1:-status}"
+
+case "$cmd" in
+    up)
+        if [ -z "$CIDRS" ]; then
+            echo "lan-rules: $RULE_FILE 为空或不存在，跳过"
+            exit 0
+        fi
+        echo "lan-rules: 添加 ip rule (priority $PRIORITY) for:"
+        echo "$CIDRS" | while IFS= read -r cidr; do
+            # 幂等：已存在则跳过
+            if ip rule show | grep -q "from all to $cidr lookup main"; then
+                echo "  $cidr: 已存在，跳过"
+            else
+                ip rule add to "$cidr" lookup main priority "$PRIORITY"
+                echo "  $cidr: 已添加"
+            fi
+        done
+        ;;
+    down)
+        if [ -z "$CIDRS" ]; then
+            exit 0
+        fi
+        echo "lan-rules: 删除 ip rule (priority $PRIORITY) for:"
+        echo "$CIDRS" | while IFS= read -r cidr; do
+            ip rule del to "$cidr" lookup main priority "$PRIORITY" 2>/dev/null \
+                && echo "  $cidr: 已删除" \
+                || echo "  $cidr: 不存在，跳过"
+        done
+        ;;
+    status)
+        echo "=== lan-rules 配置 ($RULE_FILE) ==="
+        if [ -f "$RULE_FILE" ]; then
+            cat "$RULE_FILE"
+        else
+            echo "(文件不存在)"
+        fi
+        echo ""
+        echo "=== 当前 ip rule (priority $PRIORITY) ==="
+        ip rule show | grep "^$PRIORITY:" || echo "(无)"
+        echo ""
+        echo "=== Tailscale table 52 (throw/default) ==="
+        ip route show table 52 | grep -E '^(throw|default)' || echo "(无)"
+        ;;
+    *)
+        echo "用法: $0 {up|down|status}" >&2
+        exit 1
+        ;;
+esac

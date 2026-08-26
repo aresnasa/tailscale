@@ -89,3 +89,56 @@
           汇总: {{ ok | length }}/{{ curl_results.results | length }} 成功
           若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。
           若 google 等被墙站点失败：确认 Mac 已配置 ts_forward_proxy 指向 Clash Verge。
+
+- name: 验证 217 内网双向可达（exit node 不破坏内网访问）
+  hosts: remote
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tasks:
+    - name: 获取物理网卡默认网关（非 tailscale0）
+      ansible.builtin.shell: |
+        ip -4 route show default | grep -v tailscale | awk '{print $3}' | head -1
+      register: lan_gw
+      changed_when: false
+      failed_when: false
+
+    - name: ping 内网网关（验证出方向内网直连）
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 2 {{ lan_gw.stdout }}"
+      register: gw_ping
+      changed_when: false
+      failed_when: false
+      when: lan_gw.stdout | length > 0
+
+    - name: 获取本机物理 IP（非 tailscale0）
+      ansible.builtin.shell: |
+        ip -4 addr show | grep -v tailscale | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1
+      register: lan_ip
+      changed_when: false
+      failed_when: false
+
+    - name: 查看内网 ip rule 配置
+      ansible.builtin.shell: |
+        echo "=== ip rule (5260 lan-access) ==="
+        ip rule show | grep '^5260:' || echo '(无 lan-access 规则)'
+        echo ""
+        echo "=== table 52 throw/default ==="
+        ip route show table 52 | grep -E '^(throw|default)' || echo '(无)'
+      register: lan_rules_check
+      changed_when: false
+
+    - name: 输出内网连通性验证
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 内网双向可达验证 ====="
+          - "物理 IP: {{ lan_ip.stdout | default('(未检测到)') }}"
+          - "内网网关: {{ lan_gw.stdout | default('(未检测到)') }}"
+          - "网关 ping: {{ '✓ 可达' if (gw_ping.rc | default(1)) == 0 else '✗ 不可达' }}"
+          - ""
+          - "{{ lan_rules_check.stdout_lines }}"
+          - ""
+          - "若网关不可达:"
+          - "  1. 确认已运行 deploy.yml --tags up,lan"
+          - "  2. 确认 ts_ignore_routes 包含本机网段"
+          - "  3. 检查 tailscale-lan-rules.service: systemctl status tailscale-lan-rules"
+          - "  4. 手动应用: /usr/local/sbin/tailscale-lan-rules.sh up"

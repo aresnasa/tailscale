@@ -85,6 +85,33 @@ ts_ignore_routes=['10.0.0.0/8','192.168.0.0/16','172.16.0.0/12']
   被忽略网段在 table 52 无匹配 → 落回 main 表 → 物理网关直连
 - tailnet 自身地址（100.64/10）不受影响
 
+## 内网双向可达（lan-access）
+
+**`--ignore-routes` 的不足与补充**。调试中发现：`--ignore-routes` 只处理**出方向**路由
+（让发往内网的包走 main 表），但**入方向回包**仍会命中 `ip rule` 第 5270 条
+`from all lookup 52` → 查 table 52 → 命中 `throw <本机网段>` 或 `default dev tailscale0`
+→ 丢弃或走隧道 → **内网不可达**（外部客户端连不上本机物理 IP）。
+
+`deploy.yml --tags up` 在 `tailscale up` 后自动运行 lan-access 步骤：
+
+1. 写入 `/etc/tailscale/lan-routes.conf`（与 `ts_ignore_routes` 同一份 CIDR 列表）
+2. 安装 `/usr/local/sbin/tailscale-lan-rules.sh` + `tailscale-lan-rules.service`
+3. 在 `ip rule` priority **5260**（< Tailscale 5270）插入 `to <CIDR> lookup main` 规则
+   → 内核在 Tailscale 规则之前命中 main 表 → 内网流量双向直连
+
+```sh
+# 单独运行（不重新 up，只刷新 ip rule）
+./.venv/bin/ansible-playbook playbooks/lan-access.yml
+
+# 验证内网可达
+./.venv/bin/ansible-playbook playbooks/verify.yml           # 含内网网关 ping 测试
+```
+
+优先级关系：`force-tunnel(5050) < bypass(5100) < lan-access(5260) < tailscale(5270)`
+
+幂等：shell 脚本用 grep 跳过已存在的规则；CIDR 列表变化时更新 conf 后重启 service。
+持久化：`tailscale-lan-rules.service` 在 `tailscaled.service` 之后启动，重启自动恢复 ip rule。
+
 ## 直连白名单（bypass.yml）
 
 **按域名补充方案（/32 级）**：适合没有固定网段、只能给域名的少量主机。
@@ -268,9 +295,12 @@ ansible/
 │   ├── templates/
 │   │   ├── tailscaled.env.j2         # /etc/default/tailscaled
 │   │   ├── tailscaled.service.j2     # linux systemd 单元
-│   │   └── com.tailscale.tailscaled.plist.j2  # mac launchd daemon
-│   ├── deploy.yml                    # build -> deploy -> up -> verify
-│   ├── verify.yml                    # status + 互 ping + 217 经 Mac 访问 GitHub
+│   │   ├── com.tailscale.tailscaled.plist.j2  # mac launchd daemon
+│   │   ├── tailscale-lan-rules.sh.j2        # 内网绕过 table 52 脚本
+│   │   └── tailscale-lan-rules.service.j2   # 内网规则 systemd service
+│   ├── deploy.yml                    # build -> deploy -> up -> lan-access -> verify
+│   ├── verify.yml                    # status + 互 ping + 217 经 Mac 访问 + 内网可达
+│   ├── lan-access.yml                # 内网双向可达（ip rule 5260 绕过 table 52）
 │   ├── reset.yml                     # 清空节点状态，重启为全新未登录节点
 │   ├── bypass.yml                    # 直连白名单（绕过 exit node）
 │   ├── force-tunnel.yml              # 强制走隧道白名单（与 bypass 对称）

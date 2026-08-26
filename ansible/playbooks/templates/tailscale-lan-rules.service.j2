@@ -1,0 +1,13 @@
+[Unit]
+Description=Tailscale LAN access ip rules (bypass table 52 for ignore-routes CIDRs)
+After=tailscaled.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/tailscale-lan-rules.sh up
+ExecStop=/usr/local/sbin/tailscale-lan-rules.sh down
+
+[Install]
+WantedBy=multi-user.target

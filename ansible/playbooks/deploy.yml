@@ -148,7 +148,7 @@
           {{ ts_install_dir }}/tailscale --socket={{ ts_socket }} up
           --hostname={{ inventory_hostname }}
           {% if ts_role == 'exit-node' %}--advertise-exit-node
-          {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes
+          {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes --exit-node-allow-lan-access
           {% endif %}
           {% if ts_ignore_routes | default([]) | length > 0 %}--ignore-routes={{ ts_ignore_routes | join(',') }}
           {% endif %}
@@ -217,6 +217,72 @@
           - "{{ set_ignore.stderr_lines | default([]) }}"
           - ">> 若 daemon 未部署/未登录，先跑 --tags deploy 或带 ts_authkey 的 up。"
       when: (set_ignore.rc | default(0)) != 0
+
+- name: 配置内网绕过 table 52（exit node 场景下保证内网双向可达）
+  # 问题：--ignore-routes 让出方向内网走 main 表，但入方向回包仍命中 table 52
+  # 的 throw/default → 丢弃或走隧道 → 内网不可达。
+  # 解法：ip rule priority 5260（< Tailscale 5270）插 to <CIDR> lookup main
+  hosts: remote
+  become: true
+  gather_facts: false
+  tags: [up, lan]
+  tasks:
+    - name: 创建 /etc/tailscale 目录
+      ansible.builtin.file:
+        path: /etc/tailscale
+        state: directory
+        mode: "0755"
+
+    - name: 写入 lan-routes.conf（CIDR 列表）
+      ansible.builtin.copy:
+        dest: /etc/tailscale/lan-routes.conf
+        content: |
+          # 内网网段列表（由 ansible deploy.yml 生成）
+          # 这些 CIDR 的流量绕过 Tailscale table 52，直接走 main 表
+          # 与 tailscale up --ignore-routes 使用同一份列表
+          {% for cidr in ts_ignore_routes | default([]) %}
+          {{ cidr }}
+          {% endfor %}
+        mode: "0644"
+      register: lan_conf
+
+    - name: 安装 tailscale-lan-rules.sh
+      ansible.builtin.template:
+        src: tailscale-lan-rules.sh.j2
+        dest: /usr/local/sbin/tailscale-lan-rules.sh
+        mode: "0755"
+
+    - name: 安装 tailscale-lan-rules.service
+      ansible.builtin.template:
+        src: tailscale-lan-rules.service.j2
+        dest: /etc/systemd/system/tailscale-lan-rules.service
+        mode: "0644"
+
+    - name: daemon-reload 并启用 service
+      ansible.builtin.systemd:
+        name: tailscale-lan-rules
+        state: "{{ 'restarted' if lan_conf.changed else 'started' }}"
+        enabled: true
+        daemon_reload: true
+
+    - name: 立即应用 ip rule（幂等）
+      ansible.builtin.command:
+        cmd: /usr/local/sbin/tailscale-lan-rules.sh up
+      register: lan_rules_apply
+      changed_when: "'已添加' in lan_rules_apply.stdout"
+
+    - name: 查看 ip rule 和 table 52 状态
+      ansible.builtin.command:
+        cmd: /usr/local/sbin/tailscale-lan-rules.sh status
+      register: lan_rules_status
+      changed_when: false
+
+    - name: 输出 lan-access 状态
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 内网绕过 table 52 配置 ====="
+          - "忽略网段: {{ ts_ignore_routes | default([]) }}"
+          - "{{ lan_rules_status.stdout_lines }}"
 
 - name: 验证 daemon 与 CLI 连通
   hosts: all
