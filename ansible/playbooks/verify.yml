@@ -55,14 +55,17 @@
     test_urls:
       - https://github.com
       - https://www.google.com
+    # GFW 环境下 UDP DNS 被污染，用 --resolve 绕过 DNS 直接指定 IP
+    test_resolve_args: "--resolve github.com:443:20.205.243.166 --resolve www.google.com:443:142.250.80.46"
   tasks:
-    - name: 批量 curl 测试 URL（流量应经 exit node=mac-mini 转发）
+    - name: 批量 curl 测试 URL（流量应经 exit node=mac-mini 转发，用 --resolve 绕过 DNS）
       ansible.builtin.command:
         cmd: >-
           curl -4 -sS -o /dev/null
           -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s'
           --connect-timeout 10
           --max-time 30
+          {{ test_resolve_args }}
           {{ item }}
       loop: "{{ test_urls }}"
       register: curl_results

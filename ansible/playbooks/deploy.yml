@@ -281,6 +281,17 @@
         - ts_authkey | length == 0
         - "'Logged out' in (mac_status.stdout | default(''))"
 
+    # ---- 已登录：直接执行 up 更新配置（advertise-exit-node 等）----
+    - name: tailscale up（已登录，更新 advertise-exit-node 配置）
+      ansible.builtin.command:
+        cmd: "{{ ts_up_cmd }}"
+      register: up_mac_loggedin
+      changed_when: true
+      failed_when: false
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' not in (mac_status.stdout | default(''))"
+
     - name: 输出 Mac 登录指引
       ansible.builtin.debug:
         msg: |
@@ -293,6 +304,7 @@
           ║  授权后 Mac 会自动加入 tailnet 并广播 exit node。            ║
           {% else %}
           ║  Mac 状态: {{ mac_status.stdout_lines | default(['未知']) }}
+          ║  up 结果: {{ up_mac_loggedin.stdout_lines | default([]) }}
           ║  如需登录: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
           {% endif %}
           ╚══════════════════════════════════════════════════════════════╝
@@ -338,6 +350,17 @@
         - ts_authkey | length == 0
         - "'Logged out' in (client_status.stdout | default(''))"
 
+    # ---- 已登录：直接执行 up 更新配置（exit-node/ignore-routes 等）----
+    - name: tailscale up（已登录，更新 exit-node 配置）
+      ansible.builtin.command:
+        cmd: "{{ ts_up_cmd }}"
+      register: up_client_loggedin
+      changed_when: true
+      failed_when: false
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' not in (client_status.stdout | default(''))"
+
     - name: 输出客户端登录指引
       ansible.builtin.debug:
         msg: |
@@ -350,7 +373,9 @@
           ║  授权后客户端会自动加入 tailnet 并通过 Mac 出网。            ║
           {% else %}
           ║  客户端状态: {{ client_status.stdout_lines | default(['未知']) }}
-          ║  up 输出: {{ up_client_nologin.stdout_lines | default([]) }}
+          ║  up 结果: {{ up_client_loggedin.stdout_lines | default([]) }}
+          ║  up 错误: {{ up_client_loggedin.stderr_lines | default([]) }}
+          ║  如需登录: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
           {% endif %}
           ║                                                              ║
           ║  ⚠ 若提示 exit node 不可用：                                 ║
@@ -363,15 +388,15 @@
         - ts_authkey | length == 0
         - "'Logged out' in (client_status.stdout | default(''))"
 
-    - name: 若客户端 up 失败（authkey 模式），提示去管理后台审批
+    - name: 若客户端 up 失败（已登录模式），提示去管理后台审批
       ansible.builtin.debug:
         msg: |
           ╔══════════════════════════════════════════════════════════════╗
-          ║  {{ inventory_hostname }} up 失败 — exit node 未审批        ║
+          ║  {{ inventory_hostname }} up 失败 — exit node 未审批或不可用 ║
           ╠══════════════════════════════════════════════════════════════╣
-          ║  rc={{ up_client.rc | default('?') }}
-          ║  输出: {{ up_client.stdout_lines | default([]) }}
-          ║  错误: {{ up_client.stderr_lines | default([]) }}
+          ║  rc={{ up_client_loggedin.rc | default('?') }}
+          ║  输出: {{ up_client_loggedin.stdout_lines | default([]) }}
+          ║  错误: {{ up_client_loggedin.stderr_lines | default([]) }}
           ║                                                              ║
           ║  >> exit node 必须在管理后台一次性审批：                      ║
           ║     https://login.tailscale.com/admin/machines               ║
@@ -381,7 +406,10 @@
           ║  审批后重跑:                                                 ║
           ║     ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up
           ╚══════════════════════════════════════════════════════════════╝
-      when: (ts_authkey | length > 0) and (up_client.rc | default(1) != 0)
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' not in (client_status.stdout | default(''))"
+        - (up_client_loggedin.rc | default(1)) != 0
 
 # ═══════════════════════════════════════════════════════════════
 # 阶段 3d: 应用路由忽略配置 + 内网绕过 table 52
@@ -554,14 +582,18 @@
     test_urls:
       - https://github.com
       - https://www.google.com
+    # GFW 环境下 UDP DNS 被污染，用 --resolve 绕过 DNS 直接指定 IP
+    # 这些 IP 通过 exit node + Clash 访问，验证隧道转发是否正常
+    test_resolve_args: "--resolve github.com:443:20.205.243.166 --resolve www.google.com:443:142.250.80.46"
   tasks:
-    - name: 批量 curl 测试 URL（流量应经 exit node 转发）
+    - name: 批量 curl 测试 URL（流量应经 exit node 转发，用 --resolve 绕过 DNS 污染）
       ansible.builtin.command:
         cmd: >-
           curl -4 -sS -o /dev/null
           -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s'
           --connect-timeout 10
           --max-time 30
+          {{ test_resolve_args }}
           {{ item }}
       loop: "{{ test_urls }}"
       register: curl_results
