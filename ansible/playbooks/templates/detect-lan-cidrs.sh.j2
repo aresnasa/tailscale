@@ -1,80 +1,32 @@
 #!/bin/sh
-# detect-lan-cidrs.sh — 检测本机物理网卡的私有网段，输出需要 ignore 的 RFC1918 CIDR 列表
+# detect-lan-cidrs.sh — 输出需要 ignore 的 RFC1918 私有网段列表
 #
-# 策略:
-#   1. 扫描所有网卡的 IPv4 地址（排除虚拟/容器/tunnel 接口）
-#   2. 提取落在 10/8、172.16/12、192.168/16 私有段的子网
-#   3. 映射到对应的 RFC1918 大网段输出（去重）
+# 策略：直接输出三大 RFC1918 私有网段，覆盖所有可能的内网场景：
+#   - 物理网卡 LAN（10.x、172.16-31.x、192.168.x）
+#   - Docker bridge（默认 172.17.0.0/16）
+#   - Docker user-defined network（172.18-31.x）
+#   - K8s pod/service（10.x、172.x）
+#   - Cilium/Flannel/Calico 等 CNI（10.x、192.168.x）
 #
-# 排除的接口（虚拟/容器/tunnel，其地址不代表物理网络）:
-#   lo, tailscale*, cilium*, kube-ipvs*, lxc*, lxc_health, docker*, br-*,
-#   veth*, virbr*, vnet*, tun*, tap*, flannel*, cni*, cali*
+# 这样不管容器/集群用了哪个内网段，都不会被 exit node 隧道捕获，
+# 避免内网不可达问题。公网流量仍正常走 exit node。
 #
-# 输出: 一行一个 CIDR（如 10.0.0.0/8），供 Ansible 读取
+# 如果节点有公网 IP 落在这些段内（极少见），可在 host_vars 手动覆盖。
+#
+# 输出: 一行一个 CIDR，供 Ansible 读取
 #
 # 用法: detect-lan-cidrs.sh
 
-set -eu
-
-# 排除的接口前缀/名称（用 grep -E 匹配）
-EXCLUDE_PATTERN='^(lo|tailscale|cilium|kube-ipvs|lxc|docker|br-|veth|virbr|vnet|tun|tap|flannel|cni|cali|nodelocaldns|kube-|ovs-)'
-
-# 提取物理网卡的 IPv4 地址 + 前缀长度
-# ip -o -4 addr 输出格式: "2: enp1s0    inet 10.9.202.217/24 brd ... scope global enp1s0\       valid_lft forever preferred_lft forever"
-ADDRS=$(ip -o -4 addr show 2>/dev/null \
-    | awk '{print $2, $4}' \
-    | grep -vE "$EXCLUDE_PATTERN" \
-    | awk '{print $2}' \
-    | sed 's|/.*||' \
-    || true)
-
-if [ -z "$ADDRS" ]; then
-    # 没检测到物理网卡私有地址，输出空
+# 如果有自定义配置文件 /etc/tailscale/custom-ignore-routes.conf，优先用它
+# （管理员可在此文件中精确指定要忽略的网段，覆盖默认的三大段）
+if [ -f /etc/tailscale/custom-ignore-routes.conf ]; then
+    grep -v '^[[:space:]]*#' /etc/tailscale/custom-ignore-routes.conf \
+        | grep -v '^[[:space:]]*$' \
+        | sort -u
     exit 0
 fi
 
-CIDRS=""
-
-for addr in $ADDRS; do
-    # 检查是否是 10.0.0.0/8
-    first_octet=$(echo "$addr" | cut -d. -f1)
-    second_octet=$(echo "$addr" | cut -d. -f2)
-
-    case "$first_octet" in
-        10)
-            cidr="10.0.0.0/8"
-            ;;
-        172)
-            # 172.16.0.0 - 172.31.255.255 是私有段
-            if [ "$second_octet" -ge 16 ] && [ "$second_octet" -le 31 ]; then
-                cidr="172.16.0.0/12"
-            else
-                continue
-            fi
-            ;;
-        192)
-            # 192.168.0.0/16 是私有段
-            if [ "$second_octet" -eq 168 ]; then
-                cidr="192.168.0.0/16"
-            else
-                continue
-            fi
-            ;;
-        *)
-            # 非私有地址，跳过
-            continue
-            ;;
-    esac
-
-    # 去重
-    case "$CIDRS" in
-        *"$cidr"*) ;;  # 已存在
-        *) CIDRS="${CIDRS:+$CIDRS
-}$cidr" ;;
-    esac
-done
-
-# 输出结果
-if [ -n "$CIDRS" ]; then
-    echo "$CIDRS"
-fi
+# 默认：输出 RFC1918 三大私有网段
+echo "10.0.0.0/8"
+echo "172.16.0.0/12"
+echo "192.168.0.0/16"
