@@ -1,6 +1,9 @@
 ---
-# 快速连通验证：tailscale status + 两机互 ping + 217 经 Mac 访问 GitHub
-# 用法: ansible-playbook playbooks/verify.yml -K
+# 快速连通验证：tailscale status + 两机互 ping + 217 经 Mac 批量访问测试 URL
+# 用法:
+#   ./.venv/bin/ansible-playbook playbooks/verify.yml
+#   ./.venv/bin/ansible-playbook playbooks/verify.yml -e '{"test_urls":["https://www.google.com","https://github.com"]}'
+#   ./.venv/bin/ansible-playbook playbooks/verify.yml -e @test-urls.yml
 
 - name: 收集两节点的 tailscale 状态
   hosts: all
@@ -43,15 +46,26 @@
       ansible.builtin.debug:
         msg: "{{ ping_result.stdout_lines | default(['ping 失败，确认两端已 tailscale up']) }}"
 
-- name: 验证 217 经 Mac 出口节点访问 GitHub
+- name: 验证 217 经 Mac 出口节点批量访问测试 URL
   hosts: remote
   become: "{{ ts_become | bool }}"
   gather_facts: false
+  vars:
+    # 默认测试列表，可通过 group_vars 或 -e test_urls 覆盖
+    test_urls:
+      - https://github.com
+      - https://www.google.com
   tasks:
-    - name: curl GitHub（流量应经 exit node=mac-mini 转发）
+    - name: 批量 curl 测试 URL（流量应经 exit node=mac-mini 转发）
       ansible.builtin.command:
-        cmd: curl -sS -o /dev/null -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s\n' https://github.com
-      register: gh
+        cmd: >-
+          curl -4 -sS -o /dev/null
+          -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s'
+          --connect-timeout 5
+          --max-time 15
+          {{ item }}
+      loop: "{{ test_urls }}"
+      register: curl_results
       changed_when: false
       failed_when: false
 
@@ -62,9 +76,16 @@
       changed_when: false
       failed_when: false
 
-    - name: 输出 GitHub 访问结果
+    - name: 输出批量访问结果
       ansible.builtin.debug:
-        msg:
-          - "217 -> github.com: {{ gh.stdout | default(gh.stderr) }}"
-          - "（若 HTTP 200 且 remote_ip 是公网地址，说明已成功经 Mac 出网）"
-          - "若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。"
+        msg: |
+          ===== {{ inventory_hostname }} 经 Mac exit node 访问测试 =====
+          测试 URL 列表: {{ test_urls }}
+          {% for r in curl_results.results %}
+          217 -> {{ r.item }}:
+            {{ r.stdout | default(r.stderr) | trim }}
+          {% endfor %}
+          {% set ok = curl_results.results | selectattr('rc', 'equalto', 0) | list %}
+          汇总: {{ ok | length }}/{{ curl_results.results | length }} 成功
+          若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。
+          若 google 等被墙站点失败：确认 Mac 已配置 ts_forward_proxy 指向 Clash Verge。

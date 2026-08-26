@@ -36,6 +36,13 @@ ts_up_extra_args: ""
 #   ts_forward_proxy: "http://127.0.0.1:7890"      # Clash Verge HTTP
 ts_forward_proxy: "http://127.0.0.1:7890"
 
+# ---- 连通验证测试 URL 列表（verify.yml）----
+# verify.yml 会从 217 经 Mac exit node 批量 curl 这些 URL。
+# 可通过 -e '{"test_urls":[...]}' 或 -e @file.yml 临时覆盖。
+test_urls:
+  - https://github.com
+  - https://www.google.com
+
 # ---- 出口节点（exit node）拓扑 ----
 # 由清单里的 ts_role 驱动 deploy.yml 的 up 任务：
 #   exit-node         -> tailscale up --advertise-exit-node（本机做网关）
