@@ -496,6 +496,41 @@
           - "{{ lan_rules_apply.stdout_lines | default([]) }}"
 
 # ═══════════════════════════════════════════════════════════════
+# 阶段 3e: 配置 TCP DNS 转发（绕过 GFW UDP 53 封锁）
+# ═══════════════════════════════════════════════════════════════
+- name: 配置 TCP DNS 转发（绕过 GFW UDP 53 封锁）
+  # 问题：217 的 DNS 查询经 MagicDNS 到 Mac tailscaled → SERVFAIL（无上游 resolver）
+  # 解法：本地 dnsmasq 用 TCP 转发到 8.8.8.8（经 exit node 隧道）
+  hosts: remote
+  become: true
+  gather_facts: false
+  tags: [up, dns]
+  tasks:
+    - name: 确保 dnsmasq 已安装
+      ansible.builtin.apt:
+        name: dnsmasq
+        state: present
+        update_cache: true
+
+    - name: 安装 TCP DNS 配置脚本
+      ansible.builtin.template:
+        src: setup-dns-tcp.sh.j2
+        dest: /usr/local/sbin/setup-dns-tcp.sh
+        mode: "0755"
+
+    - name: 执行 DNS 配置
+      ansible.builtin.command:
+        cmd: /usr/local/sbin/setup-dns-tcp.sh up
+      register: dns_setup
+      changed_when: "'已启动' in dns_setup.stdout"
+
+    - name: 输出 DNS 配置结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} TCP DNS 配置 ====="
+          - "{{ dns_setup.stdout_lines }}"
+
+# ═══════════════════════════════════════════════════════════════
 # 阶段 4: 验证连通性
 # ═══════════════════════════════════════════════════════════════
 - name: 验证 daemon 与 CLI 连通

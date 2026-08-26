@@ -1,0 +1,75 @@
+---
+# 配置 TCP DNS 转发，绕过 GFW 的 UDP 53 封锁
+#
+# 问题：217 的 DNS 查询经 MagicDNS (100.100.100.100) 到 Mac tailscaled，
+# 但 Mac 的 userspace-networking 模式无上游 DNS resolver → SERVFAIL。
+# UDP 53 被 GFW 封锁，但 TCP 53 经 exit node 隧道可正常工作。
+#
+# 解法：在 217 本地跑 dnsmasq，监听 127.0.0.1:53，用 TCP 转发到 8.8.8.8/1.1.1.1。
+# 必须在 tailscale up --exit-node 之后运行（TCP DNS 需经 exit node 隧道）。
+#
+# 用法:
+#   ./.venv/bin/ansible-playbook playbooks/dns-tcp.yml
+#   ./.venv/bin/ansible-playbook playbooks/dns-tcp.yml -e dns_tcp_state=down  # 恢复
+
+- name: 配置 TCP DNS 转发（绕过 GFW UDP 53 封锁）
+  hosts: remote
+  become: true
+  gather_facts: false
+  vars:
+    dns_tcp_state: up
+  tasks:
+    - name: 确保 dnsmasq 已安装
+      ansible.builtin.apt:
+        name: dnsmasq
+        state: present
+        update_cache: true
+
+    - name: 安装 TCP DNS 配置脚本
+      ansible.builtin.template:
+        src: setup-dns-tcp.sh.j2
+        dest: /usr/local/sbin/setup-dns-tcp.sh
+        mode: "0755"
+
+    - name: 执行 DNS 配置（up 或 down）
+      ansible.builtin.command:
+        cmd: "/usr/local/sbin/setup-dns-tcp.sh {{ dns_tcp_state }}"
+      register: dns_setup
+      changed_when: "'已启动' in dns_setup.stdout or '已恢复' in dns_setup.stdout"
+
+    - name: 输出 DNS 配置结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} TCP DNS 配置 ====="
+          - "状态: {{ dns_tcp_state }}"
+          - "{{ dns_setup.stdout_lines }}"
+
+    # ---- 验证 DNS 解析 ----
+    - name: 验证 DNS 解析（google.com）
+      ansible.builtin.command:
+        cmd: "dig +short www.google.com @127.0.0.1"
+      register: dns_test
+      changed_when: false
+      failed_when: false
+      when: dns_tcp_state == 'up'
+
+    - name: 输出 DNS 验证结果
+      ansible.builtin.debug:
+        msg:
+          - "DNS 解析 www.google.com: {{ '✓ ' + dns_test.stdout_lines[0] if (dns_test.rc | default(1)) == 0 and dns_test.stdout_lines | length > 0 else '✗ 失败' }}"
+      when: dns_tcp_state == 'up'
+
+    # ---- 验证 curl 不再需要 --resolve ----
+    - name: 验证 curl google.com（无需 --resolve）
+      ansible.builtin.command:
+        cmd: curl -4 -sS -o /dev/null -w "HTTP %{http_code} from %{remote_ip} in %{time_total}s" --connect-timeout 10 --max-time 30 https://www.google.com
+      register: curl_test
+      changed_when: false
+      failed_when: false
+      when: dns_tcp_state == 'up'
+
+    - name: 输出 curl 验证结果
+      ansible.builtin.debug:
+        msg:
+          - "curl https://www.google.com: {{ curl_test.stdout if (curl_test.rc | default(1)) == 0 else '✗ ' + (curl_test.stderr | default('失败')) }}"
+      when: dns_tcp_state == 'up'

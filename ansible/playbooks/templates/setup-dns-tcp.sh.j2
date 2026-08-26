@@ -1,0 +1,132 @@
+#!/bin/sh
+# setup-dns-tcp.sh — 配置 dnsmasq 用 TCP DNS 转发，绕过 GFW 的 UDP 53 封锁
+#
+# 问题：GFW 环境下 UDP 53 被 Wall，217 的 DNS 查询（经 MagicDNS 100.100.100.100）
+# 到 Mac tailscaled 后返回 SERVFAIL（Mac 的 tailscaled 无上游 DNS resolver）。
+#
+# 解法：在 217 本地跑 dnsmasq，监听 127.0.0.1:53，用 TCP 转发到 8.8.8.8/1.1.1.1。
+# TCP 53 经 exit node 隧道到 Mac → Clash 代理 → 公网 DNS，正常工作。
+#
+# 用法:
+#   setup-dns-tcp.sh up      # 安装并启动 dnsmasq TCP DNS
+#   setup-dns-tcp.sh down    # 恢复原始 DNS 配置
+#   setup-dns-tcp.sh status  # 查看状态
+
+set -eu
+
+DNSMASQ_CONF="/etc/dnsmasq.d/tcp-forward.conf"
+RESOLV_CONF_BACKUP="/etc/resolv.conf.tailscale-backup"
+DNS_SERVERS="8.8.8.8,1.1.1.1"
+
+cmd="${1:-status}"
+
+case "$cmd" in
+    up)
+        echo "dns-tcp: 配置 dnsmasq TCP DNS 转发..."
+
+        # 1. 生成 dnsmasq 配置
+        cat > "$DNSMASQ_CONF" <<EOF
+# 由 setup-dns-tcp.sh 生成
+# 用 TCP 转发 DNS 查询到公共 DNS，绕过 GFW 的 UDP 53 封锁
+# TCP 53 经 Tailscale exit node 隧道到 Mac → Clash → 公网 DNS
+
+# 监听本地 53 端口
+listen-address=127.0.0.1
+port=53
+bind-interfaces
+
+# 不读取 /etc/resolv.conf（避免循环）
+no-resolv
+
+# TCP 转发到公共 DNS（经 exit node）
+server=8.8.8.8
+server=1.1.1.1
+
+# 强制 TCP 模式（GFW 封锁 UDP 53）
+dns-forward-max=150
+cache-size=1000
+
+# 日志（调试用，稳定后可注释）
+# log-queries
+EOF
+        echo "dns-tcp: 配置写入 $DNSMASQ_CONF"
+
+        # 2. 停掉 systemd-resolved 的 53 端口占用
+        if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+            # 修改 systemd-resolved 不监听 53 端口
+            mkdir -p /etc/systemd/resolved.conf.d
+            cat > /etc/systemd/resolved.conf.d/no-stub-listener.conf <<EOF
+[Resolve]
+DNSStubListener=no
+EOF
+            systemctl restart systemd-resolved
+            echo "dns-tcp: systemd-resolved stub listener 已关闭"
+        fi
+
+        # 3. 备份并替换 /etc/resolv.conf
+        if [ ! -f "$RESOLV_CONF_BACKUP" ]; then
+            cp -a /etc/resolv.conf "$RESOLV_CONF_BACKUP"
+            echo "dns-tcp: 原始 resolv.conf 备份到 $RESOLV_CONF_BACKUP"
+        fi
+
+        cat > /etc/resolv.conf <<EOF
+# 由 setup-dns-tcp.sh 生成 — DNS 查询走本地 dnsmasq（TCP 转发到 8.8.8.8）
+nameserver 127.0.0.1
+options edns0 trust-ad
+search tail3b5cc5.ts.net default.svc.cluster.local svc.cluster.local cluster.local host.shzhisuan.com
+EOF
+        echo "dns-tcp: /etc/resolv.conf 已更新指向 127.0.0.1"
+
+        # 4. 启动 dnsmasq
+        systemctl enable dnsmasq >/dev/null 2>&1 || true
+        systemctl restart dnsmasq
+        echo "dns-tcp: dnsmasq 已启动"
+
+        # 5. 验证
+        sleep 1
+        if dig +short www.google.com @127.0.0.1 >/dev/null 2>&1; then
+            echo "dns-tcp: ✓ DNS 解析正常"
+        else
+            echo "dns-tcp: ✗ DNS 解析失败，检查 dnsmasq 日志: journalctl -u dnsmasq"
+        fi
+        ;;
+    down)
+        echo "dns-tcp: 恢复原始 DNS 配置..."
+
+        systemctl stop dnsmasq 2>/dev/null || true
+        rm -f "$DNSMASQ_CONF"
+
+        # 恢复 systemd-resolved stub listener
+        rm -f /etc/systemd/resolved.conf.d/no-stub-listener.conf
+        rmdir /etc/systemd/resolved.conf.d 2>/dev/null || true
+        systemctl restart systemd-resolved 2>/dev/null || true
+
+        # 恢复 resolv.conf
+        if [ -f "$RESOLV_CONF_BACKUP" ]; then
+            cp -a "$RESOLV_CONF_BACKUP" /etc/resolv.conf
+            echo "dns-tcp: resolv.conf 已恢复"
+        fi
+        echo "dns-tcp: 已恢复原始配置"
+        ;;
+    status)
+        echo "=== dnsmasq 状态 ==="
+        systemctl is-active dnsmasq 2>&1 || echo "(未运行)"
+        echo ""
+        echo "=== dnsmasq 配置 ==="
+        cat "$DNSMASQ_CONF" 2>/dev/null || echo "(无配置)"
+        echo ""
+        echo "=== /etc/resolv.conf ==="
+        head -5 /etc/resolv.conf
+        echo ""
+        echo "=== DNS 解析测试 ==="
+        if dig +short www.google.com @127.0.0.1 2>&1 | head -3; then
+            echo "✓ DNS 正常"
+        else
+            echo "✗ DNS 失败"
+        fi
+        ;;
+    *)
+        echo "用法: $0 {up|down|status}" >&2
+        exit 1
+        ;;
+esac
