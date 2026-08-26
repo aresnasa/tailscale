@@ -34,7 +34,7 @@ ts_up_extra_args: ""
 # 示例:
 #   ts_forward_proxy: "socks5://127.0.0.1:7891"   # Clash Verge SOCKS5
 #   ts_forward_proxy: "http://127.0.0.1:7890"      # Clash Verge HTTP
-ts_forward_proxy: ""
+ts_forward_proxy: "http://127.0.0.1:7890"
 
 # ---- 出口节点（exit node）拓扑 ----
 # 由清单里的 ts_role 驱动 deploy.yml 的 up 任务：

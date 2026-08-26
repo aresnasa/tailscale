@@ -143,6 +143,41 @@ $EDITOR playbooks/group_vars/all.yml   # 修改 ts_force_tunnel_hosts
 幂等：`/etc/tailscale-force-tunnel.conf` 追踪已管理 IP，列表变更时自动清理过期条目。
 注意：tailscaled 重启会重建 table 52，手动补的 /32 路由会丢失，需重跑此 playbook。
 
+## 透传本地代理给 tailscale exit node（fork 功能：TS_FORWARD_PROXY）
+
+**问题背景**：Mac 作为 exit node（userspace-networking 模式），netstack 转发流量用标准 `net.Dialer` 直接连目标地址（源码 `wgengine/netstack/netstack.go` 的 `forwardTCP`），不走本地代理。因此当 Mac 本身无法直连目标（如 GFW 拦截 google.com）时，217 经 Mac 访问也会失败。
+
+**解决方案**：fork 给 netstack 增加了 `TS_FORWARD_PROXY` 环境变量，让 exit node 的 TCP 转发走指定的本地代理（如 Clash Verge）。
+
+```yaml
+# playbooks/group_vars/all.yml
+# 支持 socks5:// 和 http:// 两种协议
+# Clash Verge 默认 mixed-port=7890（同时支持 HTTP 和 SOCKS5）
+ts_forward_proxy: "socks5://127.0.0.1:7890"
+```
+
+```sh
+# 1. 确保 Clash Verge 已启动且代理可用
+#    验证：curl --socks5 127.0.0.1:7890 https://www.google.com
+
+# 2. 重新部署（重启 tailscaled 使环境变量生效）
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags deploy --limit local
+
+# 3. 验证：217 经 Mac exit node -> Clash Verge 访问 google
+ssh root@10.9.202.217 'curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://www.google.com'
+```
+
+**原理**（fork 源码 `wgengine/netstack/forwardproxy.go`）:
+- `netstack.Create` 时读 `TS_FORWARD_PROXY` 环境变量，构造代理 dialer
+- `forwardTCP` 优先用代理 dialer（socks5/http CONNECT），其次 `forwardDialFunc`（测试用），最后默认 `net.Dialer`
+- socks5 用 `golang.org/x/net/proxy`（和 `net/netns/socks.go` 同一依赖），http 用手写 CONNECT 隧道
+- 环境变量留空则不启用（默认行为不变）
+
+**限制**：
+- 仅支持 TCP 转发（exit node 的 TCP 流量），UDP 转发暂不走代理（`forwardUDP` 用 `net.ListenUDP`）
+- 仅对 exit node（Mac）生效，客户端无需配置
+- 改变代理地址需重启 tailscaled（launchd 重载 plist 生效）
+
 ## 重置节点（清空状态、重新开始）
 
 `reset.yml` 停止 daemon → 删除 state/socket → 重启为全新未登录节点。
