@@ -6114,6 +6114,16 @@ func (b *LocalBackend) authReconfigLocked() {
 	// the values tests pin ("linux", "windows"), which is all the
 	// override needs.
 	oneCGNATRoute := shouldUseOneCGNATRoute(b.logf, b.sys.NetMon.Get(), b.sys.ControlKnobs(), cmp.Or(b.goos, version.OS()))
+	// Merge any administrator-supplied ignore routes (from the
+	// ignore-routes.conf file in the state dir, or TS_IGNORE_ROUTES_FILE)
+	// with the prefs-derived ones. This keeps a machine's own routing
+	// table / another VPN's address space out of the tunnel without
+	// requiring per-profile prefs edits. The route manager normalizes
+	// and deduplicates the combined list.
+	ignoreRoutes := prefs.IgnoreRoutes().AsSlice()
+	if extra := b.loadCustomIgnoreRoutes(); len(extra) > 0 {
+		ignoreRoutes = append(ignoreRoutes, extra...)
+	}
 	// Sync the WireGuard device for any peers whose allowed source
 	// prefixes changed with the new prefs, such as the old and new
 	// exit node when the selection changes.
@@ -6121,6 +6131,7 @@ func (b *LocalBackend) authReconfigLocked() {
 		ExitNodeID:       prefs.ExitNodeID(),
 		ExitNodeSelected: prefs.ExitNodeID() != "" || prefs.ExitNodeIP().IsValid(),
 		RouteAll:         flags&netmap.AllowSubnetRoutes != 0,
+		IgnoreRoutes:     ignoreRoutes,
 		OneCGNAT:         oneCGNATRoute,
 	})
 	for k := range changedAllowedIPs {

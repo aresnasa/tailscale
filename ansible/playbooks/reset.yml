@@ -1,0 +1,92 @@
+---
+# 重置 tailscale 节点：停止 daemon → 清空状态 → 重启为全新未登录节点
+#
+# 用法:
+#   ./.venv/bin/ansible-playbook playbooks/reset.yml               # 重置两机
+#   ./.venv/bin/ansible-playbook playbooks/reset.yml --limit local  # 仅 Mac
+#
+# 重置后节点回到 Logged out 状态，需要重新 tailscale up（用新 auth key）：
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
+#
+# 注意：重置只清本地状态（身份/密钥/socket），不删除二进制；
+#       旧节点在管理后台会显示 offline，可手动删除或等其自动过期。
+
+- name: 重置 tailscale 节点
+  hosts: all
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tags: [reset]
+  tasks:
+    # ---- 尝试优雅登出（daemon 在线时有效；失败无所谓）----
+    - name: 尝试 tailscale logout
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} logout"
+      changed_when: false
+      failed_when: false
+      ignore_errors: true
+
+    # ---- 停止 daemon ----
+    - name: "[linux] 停止 tailscaled"
+      ansible.builtin.systemd:
+        name: tailscaled
+        state: stopped
+      when: ts_platform == 'linux'
+      ignore_errors: true
+
+    - name: "[mac] 停止 tailscaled（bootout 用户级 LaunchAgent）"
+      ansible.builtin.shell:
+        cmd: launchctl bootout gui/$(id -u)/com.tailscale.tailscaled
+      when: ts_platform == 'darwin'
+      ignore_errors: true # 未装载时报错属正常
+
+    # ---- 清空状态（身份密钥 + socket）----
+    - name: 删除 tailscale 状态目录
+      ansible.builtin.file:
+        path: "{{ ts_state_dir }}"
+        state: absent
+
+    - name: 删除残留 socket
+      ansible.builtin.file:
+        path: "{{ ts_socket }}"
+        state: absent
+      ignore_errors: true
+
+    - name: 重建状态目录
+      ansible.builtin.file:
+        path: "{{ ts_state_dir }}"
+        state: directory
+        mode: "0755"
+
+    # ---- 重启 daemon（全新状态）----
+    - name: "[linux] 启动 tailscaled"
+      ansible.builtin.systemd:
+        name: tailscaled
+        state: started
+        daemon_reload: true
+      when: ts_platform == 'linux'
+
+    - name: "[mac] 启动 tailscaled"
+      ansible.builtin.shell:
+        cmd: >-
+          launchctl kickstart -k gui/$(id -u)/com.tailscale.tailscaled 2>/dev/null
+          || launchctl bootstrap gui/$(id -u) {{ lookup('env','HOME') }}/Library/LaunchAgents/com.tailscale.tailscaled.plist
+      when: ts_platform == 'darwin'
+      changed_when: false
+
+    # ---- 等待 daemon 就绪并验证 ----
+    - name: 等待 daemon 就绪
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: reset_status
+      changed_when: false
+      failed_when: false
+      retries: 6
+      delay: 2
+      until: reset_status.rc == 0 or 'Logged out' in (reset_status.stdout | default(''))
+
+    - name: 输出重置结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 重置完成 ====="
+          - "{{ reset_status.stdout_lines | default(reset_status.stderr_lines | default(['无输出'])) }}"
+          - ">> 节点已清空，需重新 tailscale up（新 auth key）加入 tailnet"

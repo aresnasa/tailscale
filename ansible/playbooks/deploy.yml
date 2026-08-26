@@ -51,9 +51,9 @@
 
 - name: 分发并安装 tailscaled/tailscale
   hosts: all
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
-  # mac 走 launchd、linux 走 systemd，由清单里的 ts_platform 区分
+  # mac 走用户级 launchd（非 root），linux 走 systemd（root）
   tags: [deploy]
   tasks:
     - name: 安装 tailscale / tailscaled 二进制（按平台选产物）
@@ -64,10 +64,16 @@
       loop: [tailscale, tailscaled]
       notify: 重启 tailscaled
 
-    - name: 生成共享配置 /etc/default/tailscaled
+    - name: 创建状态/socket 目录
+      ansible.builtin.file:
+        path: "{{ (ts_state_dir | dirname) if ts_platform == 'darwin' else (ts_socket | dirname) }}"
+        state: directory
+        mode: "0755"
+
+    - name: 生成共享配置 tailscaled.env
       ansible.builtin.template:
         src: tailscaled.env.j2
-        dest: /etc/default/tailscaled
+        dest: "{{ '/etc/default/tailscaled' if ts_platform == 'linux' else (ts_state_dir | dirname) + '/tailscaled.env' }}"
         mode: "0644"
 
     # ---- Linux: systemd ----
@@ -87,13 +93,11 @@
         daemon_reload: true
       when: ts_platform == 'linux'
 
-    # ---- macOS: launchd ----
-    - name: "[mac] 安装 launchd plist"
+    # ---- macOS: 用户级 launchd（非 root，userspace-networking）----
+    - name: "[mac] 安装用户级 LaunchAgent plist"
       ansible.builtin.template:
         src: com.tailscale.tailscaled.plist.j2
-        dest: /Library/LaunchDaemons/com.tailscale.tailscaled.plist
-        owner: root
-        group: wheel
+        dest: "{{ lookup('env','HOME') }}/Library/LaunchAgents/com.tailscale.tailscaled.plist"
         mode: "0644"
       when: ts_platform == 'darwin'
       notify:
@@ -101,27 +105,27 @@
         - 重启 tailscaled
 
     - name: "[mac] 确保 tailscaled 已启动"
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
-          sh -c 'launchctl print system/com.tailscale.tailscaled >/dev/null 2>&1
-          || launchctl bootstrap system /Library/LaunchDaemons/com.tailscale.tailscaled.plist'
+          launchctl print gui/$(id -u)/com.tailscale.tailscaled >/dev/null 2>&1
+          || launchctl bootstrap gui/$(id -u) {{ lookup('env','HOME') }}/Library/LaunchAgents/com.tailscale.tailscaled.plist
       when: ts_platform == 'darwin'
       changed_when: false
 
   handlers:
     # plist 变更时先卸载旧服务；未装载时 bootout 报错属正常，忽略
     - name: 重装 launchd tailscaled
-      ansible.builtin.command:
-        cmd: launchctl bootout system/com.tailscale.tailscaled
+      ansible.builtin.shell:
+        cmd: launchctl bootout gui/$(id -u)/com.tailscale.tailscaled
       when: ts_platform == 'darwin'
       ignore_errors: true
 
     # 已装载则 kickstart 重启，未装载则 bootstrap 装载；必须在 bootout 之后执行
     - name: 重启 tailscaled
-      ansible.builtin.command:
+      ansible.builtin.shell:
         cmd: >-
-          sh -c 'launchctl kickstart -k system/com.tailscale.tailscaled 2>/dev/null
-          || launchctl bootstrap system /Library/LaunchDaemons/com.tailscale.tailscaled.plist'
+          launchctl kickstart -k gui/$(id -u)/com.tailscale.tailscaled 2>/dev/null
+          || launchctl bootstrap gui/$(id -u) {{ lookup('env','HOME') }}/Library/LaunchAgents/com.tailscale.tailscaled.plist
       when: ts_platform == 'darwin'
       listen: 重启 tailscaled
 
@@ -146,6 +150,8 @@
           {% if ts_role == 'exit-node' %}--advertise-exit-node
           {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes
           {% endif %}
+          {% if ts_ignore_routes | default([]) | length > 0 %}--ignore-routes={{ ts_ignore_routes | join(',') }}
+          {% endif %}
           {{ ts_up_extra_args }}
 
     - name: 预览将执行的 up 命令（未提供 authkey 时仅展示，便于人工执行）
@@ -154,7 +160,7 @@
 
 - name: 可选：出口节点先 up（Mac 广播 exit node）
   hosts: local
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [up]
   tasks:
@@ -167,7 +173,7 @@
 
 - name: 可选：客户端 up 并指向 Mac 作为 exit node
   hosts: remote
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [up]
   tasks:
@@ -190,9 +196,31 @@
           - "   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up"
       when: (ts_authkey | length > 0) and (up_client.rc | default(1) != 0)
 
+- name: 应用路由忽略配置（幂等；不重新 up 也能变更）
+  hosts: all
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tags: [up]
+  tasks:
+    - name: tailscale set --ignore-routes
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} set --ignore-routes={{ ts_ignore_routes | join(',') }}"
+      when: ts_ignore_routes | default([]) | length > 0
+      register: set_ignore
+      changed_when: set_ignore.rc | default(1) == 0
+      failed_when: false # 未登录/daemon 未起时 rc!=0 属预期，下面统一提示
+
+    - name: 若 set 失败给出提示
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: set --ignore-routes rc={{ set_ignore.rc | default('skipped') }}"
+          - "{{ set_ignore.stderr_lines | default([]) }}"
+          - ">> 若 daemon 未部署/未登录，先跑 --tags deploy 或带 ts_authkey 的 up。"
+      when: (set_ignore.rc | default(0)) != 0
+
 - name: 验证 daemon 与 CLI 连通
   hosts: all
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [verify]
   tasks:

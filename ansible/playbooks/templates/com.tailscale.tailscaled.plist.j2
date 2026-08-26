@@ -1,5 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Mac 用户级 LaunchAgent：非 root，tailscaled 用 --tun=userspace-networking -->
+<!-- 仍支持 exit node：darwin 上子网/出口转发走 netstack 用户态并自带 NAT -->
+{% if ts_forward_proxy is defined and ts_forward_proxy | length > 0 -%}
+<!-- 透传本地代理（如 Clash Verge）给 tailscale exit node 转发流量 -->
+{% endif -%}
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -8,15 +13,20 @@
 	<array>
 		<string>/bin/sh</string>
 		<string>-c</string>
-		<string>mkdir -p {{ ts_state_dir }} {{ ts_socket_dir }} &amp;&amp; exec {{ ts_install_dir }}/tailscaled --statedir={{ ts_state_dir }} --socket={{ ts_socket }} --port={{ ts_port }}</string>
+		<string>mkdir -p "{{ ts_state_dir | dirname }}" &amp;&amp; exec {{ ts_install_dir }}/tailscaled --tun=userspace-networking --statedir={{ ts_state_dir }} --socket={{ ts_socket }} --port={{ ts_port }}</string>
 	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>TS_FORWARD_PROXY</key>
+		<string>{{ ts_forward_proxy | default('') }}</string>
+	</dict>
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/var/log/tailscaled.out.log</string>
+	<string>{{ ts_state_dir | dirname }}/tailscaled.out.log</string>
 	<key>StandardErrorPath</key>
-	<string>/var/log/tailscaled.err.log</string>
+	<string>{{ ts_state_dir | dirname }}/tailscaled.err.log</string>
 </dict>
 </plist>

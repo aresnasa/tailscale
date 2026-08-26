@@ -4,7 +4,7 @@
 
 - name: 收集两节点的 tailscale 状态
   hosts: all
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
   tasks:
     - name: tailscale status
@@ -45,7 +45,7 @@
 
 - name: 验证 217 经 Mac 出口节点访问 GitHub
   hosts: remote
-  become: true
+  become: "{{ ts_become | bool }}"
   gather_facts: false
   tasks:
     - name: curl GitHub（流量应经 exit node=mac-mini 转发）

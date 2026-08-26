@@ -50,6 +50,7 @@ func (src *Prefs) Clone() *Prefs {
 	}
 	dst := new(Prefs)
 	*dst = *src
+	dst.IgnoreRoutes = append(src.IgnoreRoutes[:0:0], src.IgnoreRoutes...)
 	dst.AdvertiseTags = append(src.AdvertiseTags[:0:0], src.AdvertiseTags...)
 	dst.AdvertiseRoutes = append(src.AdvertiseRoutes[:0:0], src.AdvertiseRoutes...)
 	dst.AdvertiseServices = append(src.AdvertiseServices[:0:0], src.AdvertiseServices...)
@@ -80,6 +81,7 @@ var _PrefsCloneNeedsRegeneration = Prefs(struct {
 	AutoExitNode               ExitNodeExpression
 	InternalExitNodePrior      tailcfg.StableNodeID
 	ExitNodeAllowLANAccess     bool
+	IgnoreRoutes               []netip.Prefix
 	CorpDNS                    bool
 	RunSSH                     bool
 	RunWebClient               bool

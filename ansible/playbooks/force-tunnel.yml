@@ -1,0 +1,140 @@
+---
+# 管理"强制走隧道"白名单：指定域名的流量始终经 Tailscale 隧道（exit node）传输
+#
+# 用法:
+#   1. 编辑 playbooks/group_vars/all.yml 的 ts_force_tunnel_hosts 列表（增删域名）
+#   2. ./.venv/bin/ansible-playbook playbooks/force-tunnel.yml
+#
+# 原理（Tailscale Linux 路由架构，源码 wgengine/router/osrouter/router_linux.go 确认）:
+#   - Tailscale ipPolicyPrefBase=5200，实际 ip rule 优先级：
+#       5210 fwmark→main  5230 fwmark→default  5250 fwmark→unreachable  5270 all→table 52
+#   - exit node 流量在 table 52 匹配 0.0.0.0/1 + 128.0.0.0/1 → 走 tailscale0
+#   - ignore-routes 网段（如 10.0.0.0/8）不在 table 52 中 → 5270 fallthrough → main 直连
+#   - bypass.yml 用 5100（< 5270）让特定 IP 走 main 直连
+#
+#   force-tunnel 策略（与 bypass 对称、优先级更高）:
+#     ip rule 优先级 5050（< bypass 5100 < tailscale 5270）→ to <IP> lookup table 52
+#     + table 52 补 <IP>/32 dev tailscale0 路由（仅 ignore-routes 网段内才需要补）
+#   → 内核在 bypass(5100) 和 tailscale(5270) 之前命中 5050 → 查 table 52 → 走 tailscale0
+#
+# 必须在 tailscale up --exit-node 之后运行才有效（之前直连是默认行为）。
+# 幂等：用 /etc/tailscale-force-tunnel.conf 追踪已管理的 IP，列表变更时自动清理过期条目。
+# 注意：tailscaled 重启会重建 table 52，手动补的 /32 路由会丢失，需重跑此 playbook。
+
+- name: 配置强制走隧道白名单
+  hosts: remote
+  become: true
+  gather_facts: false
+  tasks:
+    # ---- 获取 tailscale0 接口名 ----
+    - name: 获取 Tailscale 接口名（默认 tailscale0）
+      ansible.builtin.shell: |
+        # 优先从 ip link 找 ts 前缀的接口，兜底 tailscale0
+        iface=$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^tailscale[0-9]+$' | head -1)
+        echo "${iface:-tailscale0}"
+      register: ts_iface_result
+      changed_when: false
+
+    - name: 设置接口名变量
+      ansible.builtin.set_fact:
+        ts_iface: "{{ ts_iface_result.stdout | trim }}"
+
+    # ---- 解析白名单主机名为 IP ----
+    - name: 解析强制走隧道的主机（getent ahosts，提取 IPv4 去重）
+      ansible.builtin.shell: |
+        for h in {{ ts_force_tunnel_hosts | join(' ') }}; do
+          getent ahosts "$h" 2>/dev/null | awk '{print $1}' | grep '^[0-9]'
+        done | sort -u
+      register: dns_result
+      changed_when: false
+      when: ts_force_tunnel_hosts | length > 0
+
+    - name: 提取 IP 列表
+      ansible.builtin.set_fact:
+        force_ips: "{{ dns_result.stdout_lines }}"
+      when: ts_force_tunnel_hosts | length > 0
+
+    - name: 空白名单时设为空列表
+      ansible.builtin.set_fact:
+        force_ips: []
+      when: ts_force_tunnel_hosts | length == 0
+
+    # ---- 读取旧条目用于增量清理 ----
+    - name: 检查旧的 force-tunnel 标记文件是否存在
+      ansible.builtin.stat:
+        path: /etc/tailscale-force-tunnel.conf
+      register: old_conf_stat
+
+    - name: 读取旧的 force-tunnel IP 列表
+      ansible.builtin.slurp:
+        src: /etc/tailscale-force-tunnel.conf
+      register: old_file
+      when: old_conf_stat.stat.exists
+
+    - name: 解析旧 IP 列表
+      ansible.builtin.set_fact:
+        old_ips: "{{ (old_file.content | b64decode).splitlines() }}"
+      when: old_conf_stat.stat.exists
+
+    - name: 默认空旧列表
+      ansible.builtin.set_fact:
+        old_ips: []
+      when: not old_conf_stat.stat.exists
+
+    # ---- 清理不再需要的旧条目 ----
+    - name: 清理过期的 force-tunnel 路由和 ip rule
+      ansible.builtin.shell: |
+        ip route del {{ item }}/32 dev {{ ts_iface }} table 52 2>/dev/null || true
+        ip rule del to {{ item }} lookup 52 priority 5050 2>/dev/null || true
+      loop: "{{ old_ips | difference(force_ips) }}"
+      when: old_ips | difference(force_ips) | length > 0
+      changed_when: false
+
+    # ---- 添加/更新条目 ----
+    - name: 添加 force-tunnel ip rule + table 52 路由（优先级 5050，先于 bypass 5100 和 tailscale 5270）
+      ansible.builtin.shell: |
+        # 1. ip rule: to <IP> 查 table 52，优先级 5050 < bypass(5100) < tailscale(5270)
+        ip rule show | grep -q "to {{ item }} lookup 52" \
+          || ip rule add to {{ item }} lookup 52 priority 5050
+        # 2. table 52 补 <IP>/32 dev tailscale0（若 table 52 已有覆盖路由则无需，加了也不冲突）
+        ip route show {{ item }}/32 dev {{ ts_iface }} table 52 2>/dev/null | grep -q . \
+          || ip route add {{ item }}/32 dev {{ ts_iface }} table 52 2>/dev/null || true
+      loop: "{{ force_ips }}"
+      when: force_ips | length > 0
+      changed_when: false
+
+    # ---- 持久化当前列表 ----
+    - name: 写入当前 force-tunnel IP 列表（供下次增量清理）
+      ansible.builtin.copy:
+        dest: /etc/tailscale-force-tunnel.conf
+        content: "{{ force_ips | join('\n') }}\n"
+        mode: "0644"
+      when: force_ips | length > 0
+
+    - name: 列表为空时删除标记文件
+      ansible.builtin.file:
+        path: /etc/tailscale-force-tunnel.conf
+        state: absent
+      when: force_ips | length == 0
+
+    # ---- 输出 ----
+    - name: 显示当前 force-tunnel 路由
+      ansible.builtin.shell: |
+        echo "--- ip rule (5050 force-tunnel) ---"
+        ip rule show | grep '^5050:' || echo "(无)"
+        echo "--- table 52 force-tunnel /32 路由 ---"
+        for ip in {{ force_ips | join(' ') }}; do
+          ip route show "$ip/32" table 52 2>/dev/null
+        done
+        echo "--- tailscale 接口: {{ ts_iface }} ---"
+      register: show_result
+      changed_when: false
+
+    - name: 输出结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 强制走隧道白名单 ====="
+          - "白名单域名: {{ ts_force_tunnel_hosts }}"
+          - "解析到的 IP: {{ force_ips }}"
+          - "已清理旧条目: {{ old_ips | difference(force_ips) }}"
+          - "{{ show_result.stdout_lines }}"

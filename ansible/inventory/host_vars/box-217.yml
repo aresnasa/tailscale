@@ -1,0 +1,7 @@
+---
+# box-217 作为 exit-node-client：内网网段不经 Mac 出网，直接走本机网关。
+# （fork 的 --ignore-routes 原生功能；参见 group_vars/all.yml 注释）
+ts_ignore_routes:
+  - 10.0.0.0/8
+  - 192.168.0.0/16
+  - 172.16.0.0/12

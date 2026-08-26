@@ -1,11 +1,18 @@
-# 两节点共用的 Tailscale 部署变量
-# 与 Makefile 的 TS_* 默认值保持一致（tailscaled 与 CLI 靠同一个 socket 连通）
+# 两节点共用的 Tailscale 部署变量（可被 inventory 里的 host 变量覆盖）
+# tailscaled 与 CLI 靠同一个 socket 连通
 
+# 默认走 Linux/root 路径；Mac 在 inventory 里覆盖为非 root 路径
 ts_install_dir: /usr/local/bin
 ts_state_dir: /var/lib/tailscale
-ts_socket_dir: /var/run/tailscale
-ts_socket: "{{ ts_socket_dir }}/tailscaled.sock"
+ts_socket: /var/run/tailscale/tailscaled.sock
 ts_port: 41641
+ts_user: root
+
+# Mac 非 root 运行需 userspace-networking（仍支持 exit node，走 netstack）
+ts_tun: "{{ 'userspace-networking' if ts_platform == 'darwin' else '' }}"
+
+# 是否提权：Mac=false（用户级），Linux=true（root）
+ts_become: true
 
 # 构建产物来源（相对 ansible/ 目录）
 ts_dist_dir: "{{ playbook_dir }}/../../dist"
@@ -18,6 +25,17 @@ ts_authkey: ""
 # 追加给 tailscale up 的额外参数（如 --advertise-exit-node 之外的需求）
 ts_up_extra_args: ""
 
+# ---- 透传本地代理给 tailscale exit node（fork 功能：TS_FORWARD_PROXY）----
+# Mac 作为 exit node 时，默认用 net.Dialer 直连转发，不走本地代理。
+# 设置此变量后，exit node 的转发流量经指定代理出网（如 Clash Verge）。
+# 支持 socks5://host:port 和 http://host:port 两种协议。
+# 留空则不启用（默认行为，直接转发）。
+# 仅对 exit node（Mac）生效；客户端无需配置。
+# 示例:
+#   ts_forward_proxy: "socks5://127.0.0.1:7891"   # Clash Verge SOCKS5
+#   ts_forward_proxy: "http://127.0.0.1:7890"      # Clash Verge HTTP
+ts_forward_proxy: ""
+
 # ---- 出口节点（exit node）拓扑 ----
 # 由清单里的 ts_role 驱动 deploy.yml 的 up 任务：
 #   exit-node         -> tailscale up --advertise-exit-node（本机做网关）
@@ -25,6 +43,37 @@ ts_up_extra_args: ""
 #   (未设置)          -> 普通 tailscale up
 # exit-node-client 引用的对端 tailscale 主机名（默认即 mac-mini）
 ts_exit_node: "mac-mini"
+
+# ---- 直连白名单（不走 exit node 隧道，直接从本机出网）----
+# ---- 路由忽略（fork 原生功能：--ignore-routes）----
+# 这些 CIDR 永远不走 Tailscale 隧道，始终用主机自身的路由（物理网关直连）：
+#   - 被 CIDR 完全覆盖的 accept-routes 子网路由不会被接受
+#   - exit node 的 0.0.0.0/0 拆成“补集路由”下发（table 52），被忽略网段落到 main 表直连
+#   - Tailscale 自身地址（100.64/10）不受影响，tailnet 互通不中断
+# 需要本仓库构建的二进制（上游官方版无此参数）；在每个主机上按需覆盖。
+ts_ignore_routes: []
+#  - 10.0.0.0/8
+#  - 192.168.0.0/16
+#  - 172.16.0.0/12
+
+# ---- 按域名 bypass（bypass.yml）----
+# 与上面 ts_ignore_routes 互补：适合“只有域名、无固定网段”的少量主机，
+# 解析成 /32 后用 main 表路由 + ip rule(5100) 直连。若域名已落在忽略网段内则无需重复配置。
+# 由 playbooks/bypass.yml 管理：解析域名 → 加 /32 路由 + ip rule(优先级 5100 < Tailscale 的 5270)
+# 必须在 tailscale up --exit-node 之后运行 bypass.yml 才生效
+ts_bypass_hosts:
+  - ssh.gate.yicloud.com.cn
+
+# ---- 按域名强制走隧道（force-tunnel.yml）----
+# 与 ts_bypass_hosts 互补：让指定域名的流量强制经 Tailscale 隧道（exit node）传输，
+# 即使该域名解析的 IP 落在 ts_ignore_routes 网段内（否则默认直连不走隧道）。
+# 原理：ip rule 优先级 5050（< bypass 5100 < tailscale 5270）→ to <IP> lookup table 52，
+#       并在 table 52 补 <IP>/32 dev tailscale0 路由（仅 ignore-routes 网段内才需要）。
+# 公网 IP（不在 ignore-routes 内）默认已走 exit node，无需额外处理，
+# 但若之前被 bypass 过则会被 5050 规则提前命中，纠正回隧道。
+# 由 playbooks/force-tunnel.yml 管理；必须在 tailscale up --exit-node 之后运行。
+ts_force_tunnel_hosts:
+  - www.google.com
 
 # ---- 控制面管理（playbooks/control.yml：ACL + 用户）----
 # Tailscale API 访问令牌（Settings > Keys 生成 tskey-api-...）。

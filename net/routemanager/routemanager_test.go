@@ -940,3 +940,234 @@ func TestExitNodeBlackhole(t *testing.T) {
 	commit(rm, func(m *Mutation) { m.SetPrefs(Prefs{}) })
 	wantOSRoutes(t, rm)
 }
+
+// osCovers reports whether any prefix in the OS route set contains ip.
+func osCovers(rm *RouteManager, ip netip.Addr) bool {
+	a := netip.MustParseAddr(ip.String())
+	for p := range rm.OSRoutes().All() {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSubtractPrefixes(t *testing.T) {
+	tests := []struct {
+		name string
+		base string
+		excl []string
+		want []string // nil means nil result
+	}{
+		{
+			name: "no_excludes",
+			base: "0.0.0.0/0",
+			want: []string{"0.0.0.0/0"},
+		},
+		{
+			name: "fully_covered",
+			base: "0.0.0.0/0",
+			excl: []string{"0.0.0.0/0"},
+		},
+		{
+			name: "covered_by_child",
+			base: "10.3.0.0/16",
+			excl: []string{"10.0.0.0/8"},
+		},
+		{
+			name: "no_overlap_v6_excl",
+			base: "0.0.0.0/0",
+			excl: []string{"fc00::/7"},
+			want: []string{"0.0.0.0/0"},
+		},
+		{
+			name: "minus_10slash8",
+			base: "0.0.0.0/0",
+			excl: []string{"10.0.0.0/8"},
+			want: []string{
+				"0.0.0.0/5",
+				"8.0.0.0/7",
+				"11.0.0.0/8",
+				"12.0.0.0/6",
+				"16.0.0.0/4",
+				"32.0.0.0/3",
+				"64.0.0.0/2",
+				"128.0.0.0/1",
+			},
+		},
+		{
+			name: "10slash8_minus_10_3slash16",
+			base: "10.0.0.0/8",
+			excl: []string{"10.3.0.0/16"},
+			want: []string{
+				"10.0.0.0/15",
+				"10.2.0.0/16",
+				"10.4.0.0/14",
+				"10.8.0.0/13",
+				"10.16.0.0/12",
+				"10.32.0.0/11",
+				"10.64.0.0/10",
+				"10.128.0.0/9",
+			},
+		},
+		{
+			name: "v6_minus_ula",
+			base: "::/0",
+			excl: []string{"fc00::/7"},
+			want: []string{
+				"::/1",
+				"8000::/2",
+				"c000::/3",
+				"e000::/4",
+				"f000::/5",
+				"f800::/6",
+				"fe00::/7",
+			},
+		},
+		{
+			name: "single_ip_base_uncovered",
+			base: "10.3.0.4/32",
+			excl: []string{"10.3.0.5/32"},
+			want: []string{"10.3.0.4/32"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var excl []netip.Prefix
+			for _, s := range tt.excl {
+				excl = append(excl, pfx(s))
+			}
+			got := subtractPrefixes(pfx(tt.base), excl)
+			var want []netip.Prefix
+			for _, s := range tt.want {
+				want = append(want, pfx(s))
+			}
+			if !slices.Equal(got, want) {
+				t.Errorf("subtractPrefixes(%s, %v) = %v; want %v", tt.base, tt.excl, got, want)
+			}
+		})
+	}
+}
+
+func TestIgnoreRoutesSubnetRoute(t *testing.T) {
+	rm := New(t.Logf)
+	p := peer1()
+	p.Routes = []netip.Prefix{pfx("10.3.0.0/16"), pfx("192.168.0.0/16")}
+	commit(rm, func(m *Mutation) {
+		m.upsertPeer(p)
+		m.SetPrefs(Prefs{RouteAll: true, IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8")}})
+	})
+
+	// The covered route is gone everywhere; the other stays.
+	wantOutbound(t, rm, "10.3.0.5", key.NodePublic{}, false)
+	wantOutbound(t, rm, "192.168.0.5", k1, true)
+	wantOSRoutes(t, rm, "100.64.0.1/32", "fd7a:115c:a1e0::/48", "192.168.0.0/16")
+
+	ips, ok := rm.PeerAllowedIPs(1)
+	if !ok {
+		t.Fatal("PeerAllowedIPs: peer missing")
+	}
+	for _, pfx := range ips {
+		if pfx.String() == "10.3.0.0/16" {
+			t.Errorf("PeerAllowedIPs still contains ignored 10.3.0.0/16: %v", ips)
+		}
+	}
+
+	// Self addresses are never affected by IgnoreRoutes.
+	p2 := peer2()
+	p2.Routes = []netip.Prefix{pfx("172.16.0.0/16")}
+	commit(rm, func(m *Mutation) {
+		m.upsertPeer(p2)
+		m.SetPrefs(Prefs{RouteAll: true, IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8"), tsaddr.CGNATRange()}})
+	})
+	wantOSRoutes(t, rm, "100.64.0.1/32", "100.64.0.2/32", "fd7a:115c:a1e0::/48", "172.16.0.0/16", "192.168.0.0/16")
+	wantOutbound(t, rm, "100.64.0.2", k2, true)
+
+	// Non-masked and duplicate entries normalize away at Commit.
+	res := commit(rm, func(m *Mutation) {
+		m.SetPrefs(Prefs{
+			RouteAll:     true,
+			IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8"), pfx("10.3.0.0/16")},
+		})
+	})
+	if !res.PrefsChanged {
+		t.Error("dedup normalization should still count as a prefs change")
+	}
+	if got, want := rm.prefs.IgnoreRoutes, []netip.Prefix{pfx("10.0.0.0/8")}; !slices.Equal(got, want) {
+		t.Errorf("IgnoreRoutes = %v; want %v (10.3/16 is covered by 10/8)", got, want)
+	}
+	wantOSRoutes(t, rm, "100.64.0.1/32", "100.64.0.2/32", "fd7a:115c:a1e0::/48", "172.16.0.0/16", "192.168.0.0/16")
+}
+
+func TestIgnoreRoutesExitNode(t *testing.T) {
+	rm := New(t.Logf)
+	exitPeer := peer1()
+	exitPeer.Routes = tsaddr.ExitRoutes()
+
+	// Rebuild path: peer first, then select with ignores.
+	commit(rm, func(m *Mutation) { m.upsertPeer(exitPeer) })
+	commit(rm, func(m *Mutation) {
+		m.SetPrefs(Prefs{ExitNodeID: 1, ExitNodeSelected: true, IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8")}})
+	})
+
+	// No 0.0.0.0/0; instead the exact complement of 10/8, plus ::/0.
+	wantOSRoutes(t, rm,
+		"100.64.0.1/32", "fd7a:115c:a1e0::/48",
+		"0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6",
+		"16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/1",
+		"::/0")
+
+	// Ignored destinations fall through to the system's routing.
+	if osCovers(rm, netip.MustParseAddr("10.1.2.3")) {
+		t.Error("OS route set covers 10.1.2.3; want it uncovered")
+	}
+	if !osCovers(rm, netip.MustParseAddr("8.8.8.8")) {
+		t.Error("OS route set does not cover 8.8.8.8")
+	}
+	// The exit peer still carries internet traffic in the data plane.
+	wantOutbound(t, rm, "8.8.8.8", k1, true)
+	wantOutbound(t, rm, "10.1.2.3", k1, true) // allowedIPs keep 0/0; OS routes decide
+
+	// Incremental path: a fresh exit peer under existing ignore prefs.
+	rm2 := New(t.Logf)
+	commit(rm2, func(m *Mutation) {
+		m.SetPrefs(Prefs{ExitNodeSelected: true, IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8")}})
+	})
+	// Blackhole while unresolved: complement installed even then.
+	wantOSRoutes(t, rm2,
+		"0.0.0.0/5", "8.0.0.0/7", "11.0.0.0/8", "12.0.0.0/6",
+		"16.0.0.0/4", "32.0.0.0/3", "64.0.0.0/2", "128.0.0.0/1",
+		"::/0")
+	commit(rm2, func(m *Mutation) {
+		p := exitPeer
+		p.ID = 2
+		m.upsertPeer(p)
+		m.SetPrefs(Prefs{ExitNodeID: 2, ExitNodeSelected: true, IgnoreRoutes: []netip.Prefix{pfx("10.0.0.0/8")}})
+	})
+	wantOutbound(t, rm2, "8.8.8.8", k1, true)
+	if rm2.osRoutes.Load().Get(pfx("0.0.0.0/0")) {
+		t.Error("0.0.0.0/0 installed despite IgnoreRoutes")
+	}
+	// Peer removal under selection keeps the blackhole complement.
+	commit(rm2, func(m *Mutation) { m.RemovePeer(2) })
+	if rm2.osRoutes.Load().Get(pfx("128.0.0.0/1")) == false {
+		t.Error("blackhole complement lost on peer removal")
+	}
+	if osCovers(rm2, netip.MustParseAddr("10.9.9.9")) {
+		t.Error("ignored prefix covered by blackhole complement")
+	}
+
+	// Ignoring a family's default route drops that family's exit
+	// coverage entirely; the other family is unaffected.
+	rm3 := New(t.Logf)
+	p := peer1()
+	p.Routes = tsaddr.ExitRoutes()
+	commit(rm3, func(m *Mutation) { m.upsertPeer(p) })
+	commit(rm3, func(m *Mutation) {
+		m.SetPrefs(Prefs{ExitNodeID: 1, ExitNodeSelected: true, IgnoreRoutes: []netip.Prefix{pfx("0.0.0.0/0")}})
+	})
+	wantOSRoutes(t, rm3, "100.64.0.1/32", "fd7a:115c:a1e0::/48", "::/0")
+	if osCovers(rm3, netip.MustParseAddr("8.8.8.8")) {
+		t.Error("v4 exit coverage present despite ignoring 0.0.0.0/0")
+	}
+}

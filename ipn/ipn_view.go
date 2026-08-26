@@ -290,6 +290,25 @@ func (v PrefsView) InternalExitNodePrior() tailcfg.StableNodeID { return v.ж.In
 // routed directly or via the exit node.
 func (v PrefsView) ExitNodeAllowLANAccess() bool { return v.ж.ExitNodeAllowLANAccess }
 
+// IgnoreRoutes specifies CIDR prefixes that must never be routed
+// through Tailscale. Traffic to these prefixes always uses the
+// system's own routing (typically the physical network's default
+// gateway), even when an exit node is selected or a peer
+// advertises a covering subnet route.
+//
+// An advertised subnet route fully covered by an entry here is
+// excluded from the tunnel entirely. For the exit node's default
+// routes, the complement of these prefixes is installed instead
+// of the default route itself, so only the non-ignored remainder
+// of the internet is carried by the exit node. Partially covered
+// subnet routes (an entry smaller than the advertised route) are
+// not split; the route is installed as-is.
+//
+// Peers' own Tailscale addresses (100.64.0.0/10 and the ULA
+// range) are never affected, so the tailnet itself keeps working
+// regardless of what is listed here.
+func (v PrefsView) IgnoreRoutes() views.Slice[netip.Prefix] { return views.SliceOf(v.ж.IgnoreRoutes) }
+
 // CorpDNS specifies whether to install the Tailscale network's
 // DNS configuration, if it exists. It is the internal name for
 // the "tailscale set --accept-dns=" flag.
@@ -497,6 +516,7 @@ var _PrefsViewNeedsRegeneration = Prefs(struct {
 	AutoExitNode               ExitNodeExpression
 	InternalExitNodePrior      tailcfg.StableNodeID
 	ExitNodeAllowLANAccess     bool
+	IgnoreRoutes               []netip.Prefix
 	CorpDNS                    bool
 	RunSSH                     bool
 	RunWebClient               bool

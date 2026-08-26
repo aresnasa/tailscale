@@ -28,6 +28,7 @@ var validUpFlags = set.Of(
 	"force-reauth",
 	"host-routes",
 	"hostname",
+	"ignore-routes", // fork: 同 up+set 双命令支持（playbook 幂等 up --auth-key 需携带完整 prefs）
 	"json",
 	"login-server",
 	"netfilter-mode",

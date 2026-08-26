@@ -1,0 +1,128 @@
+---
+# 管理"直连白名单"：指定主机的流量不走 exit node 隧道，直接从本机出网
+#
+# 用法:
+#   1. 编辑 playbooks/group_vars/all.yml 的 ts_bypass_hosts 列表（增删主机名）
+#   2. ./.venv/bin/ansible-playbook playbooks/bypass.yml
+#
+# 原理（Tailscale Linux 路由架构，源码确认）:
+#   - Tailscale 用 ip rule 优先级 5200 → 指向 table 52（tailscaleRouteTable）
+#   - exit node 流量在 table 52 匹配 0.0.0.0/1 + 128.0.0.0/1 → 走 tailscale0
+#   - bypass 策略: main 表加 <IP>/32 路由指向物理网关
+#                  + ip rule 优先级 5100(< 5200) → to <IP> lookup main
+#     → 内核在 Tailscale 的 5200 规则之前命中 main 表的 /32 → 直连
+#
+# 必须在 tailscale up --exit-node 之后运行才有效（之前直连是默认行为）。
+# 幂等：用 /etc/tailscale-bypass.conf 追踪已管理的 IP，列表变更时自动清理过期条目。
+
+- name: 配置直连白名单（绕过 exit node）
+  hosts: remote
+  become: true
+  gather_facts: false
+  tasks:
+    # ---- 解析白名单主机名为 IP ----
+    - name: 解析白名单主机（getent ahosts，提取 IPv4 去重）
+      ansible.builtin.shell: |
+        for h in {{ ts_bypass_hosts | join(' ') }}; do
+          getent ahosts "$h" 2>/dev/null | awk '{print $1}' | grep '^[0-9]'
+        done | sort -u
+      register: dns_result
+      changed_when: false
+      when: ts_bypass_hosts | length > 0
+
+    - name: 提取 IP 列表
+      ansible.builtin.set_fact:
+        bypass_ips: "{{ dns_result.stdout_lines }}"
+      when: ts_bypass_hosts | length > 0
+
+    - name: 空白名单时设为空列表
+      ansible.builtin.set_fact:
+        bypass_ips: []
+      when: ts_bypass_hosts | length == 0
+
+    # ---- 读取旧条目用于增量清理 ----
+    - name: 检查旧的 bypass 标记文件是否存在
+      ansible.builtin.stat:
+        path: /etc/tailscale-bypass.conf
+      register: old_conf_stat
+
+    - name: 读取旧的 bypass IP 列表
+      ansible.builtin.slurp:
+        src: /etc/tailscale-bypass.conf
+      register: old_file
+      when: old_conf_stat.stat.exists
+
+    - name: 解析旧 IP 列表
+      ansible.builtin.set_fact:
+        old_ips: "{{ (old_file.content | b64decode).splitlines() }}"
+      when: old_conf_stat.stat.exists
+
+    - name: 默认空旧列表
+      ansible.builtin.set_fact:
+        old_ips: []
+      when: not old_conf_stat.stat.exists
+
+    # ---- 清理不再需要的旧条目 ----
+    - name: 清理过期的 bypass 路由和 ip rule
+      ansible.builtin.shell: |
+        ip route del {{ item }}/32 2>/dev/null || true
+        ip rule del to {{ item }} lookup main priority 5100 2>/dev/null || true
+      loop: "{{ old_ips | difference(bypass_ips) }}"
+      when: old_ips | difference(bypass_ips) | length > 0
+      changed_when: false
+
+    # ---- 添加/更新条目 ----
+    - name: 获取默认网关和物理接口
+      ansible.builtin.shell: ip -4 route show default | awk '{print $3" "$5}' | head -1
+      register: gw_info
+      changed_when: false
+
+    - name: 添加 bypass 路由 + ip rule（优先级 5100，先于 Tailscale 的 5200）
+      ansible.builtin.shell: |
+        gw="{{ gw_info.stdout.split()[0] }}"
+        iface="{{ gw_info.stdout.split()[1] }}"
+        # /32 路由指向物理网关，放入 main 表
+        ip route replace {{ item }}/32 via "$gw" dev "$iface"
+        # ip rule: to <IP> 查 main 表，优先级 5100 < Tailscale 的 5200
+        # ip rule show 输出格式: "5100: from all to <IP> lookup main"（不带 /32）
+        ip rule show | grep -q "to {{ item }} lookup main" \
+          || ip rule add to {{ item }} lookup main priority 5100
+      loop: "{{ bypass_ips }}"
+      when: bypass_ips | length > 0
+      changed_when: false
+
+    # ---- 持久化当前列表 ----
+    - name: 写入当前 bypass IP 列表（供下次增量清理）
+      ansible.builtin.copy:
+        dest: /etc/tailscale-bypass.conf
+        content: "{{ bypass_ips | join('\n') }}\n"
+        mode: "0644"
+      when: bypass_ips | length > 0
+
+    - name: 列表为空时删除标记文件
+      ansible.builtin.file:
+        path: /etc/tailscale-bypass.conf
+        state: absent
+      when: bypass_ips | length == 0
+
+    # ---- 输出 ----
+    - name: 显示当前 bypass 路由
+      ansible.builtin.shell: |
+        echo "--- ip rule (5100) ---"
+        ip rule show | grep '^5100:' || echo "(无)"
+        echo "--- ip route (/32 bypass) ---"
+        for ip in {{ bypass_ips | join(' ') }}; do
+          ip route show "$ip/32" 2>/dev/null
+        done
+      register: show_result
+      changed_when: false
+
+    - name: 输出结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 直连白名单 ====="
+          - "白名单主机: {{ ts_bypass_hosts }}"
+          - "解析到的 IP: {{ bypass_ips }}"
+          - "网关: {{ gw_info.stdout }}"
+          - "已清理旧条目: {{ old_ips | difference(bypass_ips) }}"
+          - "{{ show_result.stdout_lines }}"

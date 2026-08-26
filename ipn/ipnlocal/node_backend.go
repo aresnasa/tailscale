@@ -970,6 +970,13 @@ type routePrefs struct {
 	// accepted.
 	RouteAll bool
 
+	// IgnoreRoutes lists prefixes that must never be routed through
+	// Tailscale, in either direction of the policy split: covered
+	// subnet routes are not accepted, and exit-node coverage is
+	// installed as the complement of these prefixes. See
+	// [routemanager.Prefs.IgnoreRoutes].
+	IgnoreRoutes []netip.Prefix
+
 	// OneCGNAT is whether the OS route set should collapse peers'
 	// CGNAT addresses into the single /10 route.
 	OneCGNAT bool
@@ -997,6 +1004,7 @@ func (nb *nodeBackend) updateRouteManagerPrefs(p routePrefs) routemanager.PeersW
 		ExitNodeID:       exitID,
 		ExitNodeSelected: p.ExitNodeSelected,
 		RouteAll:         p.RouteAll,
+		IgnoreRoutes:     p.IgnoreRoutes,
 	})
 	rt.SetTailnetConfig(routemanager.TailnetConfig{OneCGNAT: p.OneCGNAT})
 	res := rt.Commit()

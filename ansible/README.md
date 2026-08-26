@@ -4,7 +4,7 @@
 
 | 节点 | 地址 | 角色 | 平台 | 二进制产物 | 守护方式 |
 | --- | --- | --- | --- | --- | --- |
-| mac-mini（本机） | localhost | **exit node**（出口网关） | darwin/arm64 | `dist/*-darwin-arm64` | launchd (`com.tailscale.tailscaled`) |
+| mac-mini（本机） | localhost | **exit node**（出口网关） | darwin/arm64 | `dist/*-darwin-arm64` | 用户级 LaunchAgent（非 root，userspace-networking） |
 | box-217（远端） | 10.9.202.217 (root) | **exit node client**（经 Mac 出网） | linux/amd64 | `dist/*-linux-amd64` | systemd (`tailscaled.service`) |
 
 拓扑意图：217 的出网流量（含访问 GitHub）经 Tailscale 隧道送到 Mac，由 Mac 转发到公网。
@@ -29,24 +29,26 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 
 ## 使用
 
-以下命令都在 `ansible/` 目录下执行，`-K` 会提示输入 Mac 本机 sudo 密码：
+以下命令都在 `ansible/` 目录下执行（Mac 非 root 部署，无需 `-K`）：
 
 ```sh
 # 1. 全量：构建 -> 部署 -> up（Mac 先广播 exit node，217 再引用）-> 验证
-./.venv/bin/ansible-playbook playbooks/deploy.yml -K
+./.venv/bin/ansible-playbook playbooks/deploy.yml
 
 # 2. 带 auth key 一键 tailscale up（真正打通两机 + 出口路由）
-./.venv/bin/ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-auth-xxxxxxxx
+./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxxxxxxx
 
-# 3. 随时验证两机状态 & mac -> box-217 ping
+# 3. 随时验证两机状态 & 217 经 Mac 访问 GitHub
 ./.venv/bin/ansible-playbook playbooks/verify.yml
 ```
 
 ### 出口节点（exit node）注意事项
 
-- **Mac 侧无需手动 sysctl / pf**：tailscaled-on-macOS 默认用 `utun` 且子网/出口转发走
-  netstack 用户态并自带 NAT（源码 `cmd/tailscaled` 的 `handleSubnetsInNetstack`
-  在 darwin 返回 true）。launchd plist 已以 root 运行，满足 `utun` 权限。
+- **Mac 侧无需 sudo**：二进制装 `/opt/homebrew/bin`（brew 用户可写），状态/socket 放
+  `~/.tailscale/`，tailscaled 用 `--tun=userspace-networking` 跑成用户级 LaunchAgent
+  （`~/Library/LaunchAgents`）。出口转发走 netstack 用户态并自带 NAT，仍支持 exit node。
+  因此 **`ansible-playbook` 不再需要 `-K`**（远端是 root 直连，也不需要）。
+- **Mac 侧无需手动 sysctl / pf**：userspace-networking 在用户态完成转发与 NAT。
 - **exit node 必须在管理后台一次性审批**：Tailscale 没有为 exit node 提供 ACL
   授权属性（源码确认仅有 `funnel`/`ssh-aggregator` 等），所以 Mac `up --advertise-exit-node`
   后，需到 [管理后台](https://login.tailscale.com/admin/machines) → mac-mini →
@@ -61,10 +63,100 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 常用子集：
 
 ```sh
-./.venv/bin/ansible-playbook playbooks/deploy.yml --limit remote --tags deploy,verify  # 只部署远端
-./.venv/bin/ansible-playbook playbooks/deploy.yml -K --limit local  --tags deploy,verify  # 只部署本机
-./.venv/bin/ansible-playbook playbooks/deploy.yml -K -e ts_authkey=... --tags up          # 只执行 tailscale up
+./.venv/bin/ansible-playbook playbooks/deploy.yml --limit local  --tags deploy,verify  # 只部署本机
+./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=... --tags up          # 只执行 tailscale up
 ```
+
+## 路由忽略（fork 原生：--ignore-routes）
+
+**首选方案（CIDR 级）**。本仓库 fork 给 tailscale 增加了 `--ignore-routes` 参数（上游官方版没有）：
+指定网段永远不走 Tailscale 隧道，始终用主机自身路由直连，即使在用 exit node。
+
+```yaml
+# inventory/hosts.ini 按主机配置（217 已默认忽略内网三大段）：
+ts_ignore_routes=['10.0.0.0/8','192.168.0.0/16','172.16.0.0/12']
+```
+
+随 `deploy.yml --tags up` 自动下发（首次 up 带参数，后续变更用 `tailscale set --ignore-routes=...` 幂等更新，无需重新登录）。
+
+**原理**（fork 源码实现，见 `net/routemanager`）：
+- 被 CIDR 覆盖的 accept-routes 子网路由直接不安装
+- exit node 的 `0.0.0.0/0` 不再整体下发，改为拆成“补集路由”写入 table 52；
+  被忽略网段在 table 52 无匹配 → 落回 main 表 → 物理网关直连
+- tailnet 自身地址（100.64/10）不受影响
+
+## 直连白名单（bypass.yml）
+
+**按域名补充方案（/32 级）**：适合没有固定网段、只能给域名的少量主机。
+若目标 IP 已落在 `ts_ignore_routes` 网段内，则无需再配这里。
+
+指定主机的流量不走 exit node 隧道，直接从 217 本机出网。适合需要直连的内部网关、
+仓库等（如 `ssh.gate.yicloud.com.cn`）。
+
+```sh
+# 1. 编辑白名单列表
+$EDITOR playbooks/group_vars/all.yml   # 修改 ts_bypass_hosts
+
+# 2. 应用（在 tailscale up --exit-node 之后运行）
+./.venv/bin/ansible-playbook playbooks/bypass.yml
+
+# 临时覆盖（不改文件）
+./.venv/bin/ansible-playbook playbooks/bypass.yml -e '{"ts_bypass_hosts":["ssh.gate.yicloud.com.cn","github.com"]}'
+```
+
+**原理**（Tailscale Linux 路由架构，源码 `wgengine/router/osrouter/router_linux.go` 确认）:
+- Tailscale `ipPolicyPrefBase=5200`，实际 ip rule 优先级：5210/5230/5250（fwmark 出口）
+  + **5270**（from all → table 52），exit node 流量在 table 52 走 `tailscale0`
+- bypass 在 main 表加 `<IP>/32 via <物理网关>` + `ip rule` 优先级 5100（< 5270）→ `to <IP> lookup main`
+- 内核在 Tailscale 规则(5270) 之前命中 5100 → main 表 /32 → 直连
+
+幂等：`/etc/tailscale-bypass.conf` 追踪已管理 IP，列表变更时自动清理过期条目。
+
+## 强制走隧道白名单（force-tunnel.yml）
+
+**与 bypass.yml 对称**：让指定域名的流量**强制经 Tailscale 隧道**（exit node）传输，
+即使该域名解析的 IP 落在 `ts_ignore_routes` 网段内（默认直连不走隧道），
+或之前被 bypass.yml 加入了直连白名单。
+
+公网 IP（如 `www.google.com`）不在 ignore-routes 网段内时，默认已走 exit node，
+配置 force-tunnel 可确保即使未来 ignore-routes/bypass 变更也不受影响。
+
+```sh
+# 1. 编辑白名单列表
+$EDITOR playbooks/group_vars/all.yml   # 修改 ts_force_tunnel_hosts
+
+# 2. 应用（在 tailscale up --exit-node 之后运行）
+./.venv/bin/ansible-playbook playbooks/force-tunnel.yml
+
+# 临时覆盖（不改文件）
+./.venv/bin/ansible-playbook playbooks/force-tunnel.yml -e '{"ts_force_tunnel_hosts":["www.google.com","github.com"]}'
+```
+
+**原理**（与 bypass 对称，优先级更高）:
+- `ip rule` 优先级 **5050**（< bypass 5100 < tailscale 5270）→ `to <IP> lookup 52`
+- 对 ignore-routes 网段内的 IP，在 table 52 补 `<IP>/32 dev tailscale0` 路由
+  （公网 IP 已被 table 52 的 `0.0.0.0/1 + 128.0.0.0/1` 覆盖，无需补）
+- 内核在 bypass(5100) 和 tailscale(5270) 之前命中 5050 → 查 table 52 → 走 `tailscale0`
+
+优先级关系：`force-tunnel(5050) < bypass(5100) < tailscale(5270)`，三者互不冲突。
+
+幂等：`/etc/tailscale-force-tunnel.conf` 追踪已管理 IP，列表变更时自动清理过期条目。
+注意：tailscaled 重启会重建 table 52，手动补的 /32 路由会丢失，需重跑此 playbook。
+
+## 重置节点（清空状态、重新开始）
+
+`reset.yml` 停止 daemon → 删除 state/socket → 重启为全新未登录节点。
+适合测试中途换 auth key、状态变脏、或想从头来过：
+
+```sh
+./.venv/bin/ansible-playbook playbooks/reset.yml                # 重置两机
+./.venv/bin/ansible-playbook playbooks/reset.yml --limit local   # 仅 Mac
+
+# 重置后重新 up：
+./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
+```
+
+重置只清本地身份/密钥状态，不删除二进制；旧节点在管理后台显示 offline，可手动删或等过期。
 
 ## 控制面管理：ACL 策略 + 用户增删（playbooks/control.yml）
 
@@ -143,7 +235,10 @@ ansible/
 │   │   ├── tailscaled.service.j2     # linux systemd 单元
 │   │   └── com.tailscale.tailscaled.plist.j2  # mac launchd daemon
 │   ├── deploy.yml                    # build -> deploy -> up -> verify
-│   ├── verify.yml                    # status + 互 ping
+│   ├── verify.yml                    # status + 互 ping + 217 经 Mac 访问 GitHub
+│   ├── reset.yml                     # 清空节点状态，重启为全新未登录节点
+│   ├── bypass.yml                    # 直连白名单（绕过 exit node）
+│   ├── force-tunnel.yml              # 强制走隧道白名单（与 bypass 对称）
 │   └── control.yml                   # 控制面：ACL 推送 + 用户增删
 ├── tests/
 │   ├── mock_tailscale_api.py         # 本地 mock Tailscale API（离线验证 control.yml）
