@@ -1,6 +1,6 @@
 # Makefile —— 通过 ./build_dist.sh 交叉编译 Tailscale 二进制（tailscale + tailscaled）
 # 并生成样例部署配置，保证 tailscaled 与 tailscale CLI 正确连通
-# 产物统一输出到 $(BIN_DIR)/（默认 .bin/），命名: <bin>-<os>-<arch>[.exe]
+# 产物统一输出到 $(BIN_DIR)/（默认 dist/），命名: <bin>-<os>-<arch>[.exe]
 
 .DEFAULT_GOAL := build
 
@@ -11,7 +11,7 @@ GOARCH ?= amd64
 CGO_ENABLED ?= 0
 
 PKGS    ?= tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
-BIN_DIR ?= .bin
+BIN_DIR ?= dist
 
 # ---- 样例配置相关（make config）----
 CONF_DIR       ?= config
@@ -123,7 +123,7 @@ endef
 define config_readme
 # Tailscale 部署样例配置（由 make config 生成）
 
-本目录供部署 linux/amd64 使用（二进制在 .bin/ 目录）。文件说明:
+本目录供部署 linux/amd64 使用（二进制在 $(BIN_DIR)/ 目录）。文件说明:
 
 - tailscaled.env     tailscaled 与 CLI 的共享配置（连通核心: TS_SOCKET 必须一致）
 - tailscaled.service systemd 服务样例（参考上游 cmd/tailscaled/tailscaled.service）
@@ -134,8 +134,8 @@ define config_readme
 ## Linux 部署步骤（root，目标机）
 
 1. 复制二进制并按平台改名:
-   scp .bin/tailscale-linux-amd64  root@HOST:$(TS_INSTALL_DIR)/tailscale
-   scp .bin/tailscaled-linux-amd64 root@HOST:$(TS_INSTALL_DIR)/tailscaled
+   scp $(BIN_DIR)/tailscale-linux-amd64  root@HOST:$(TS_INSTALL_DIR)/tailscale
+   scp $(BIN_DIR)/tailscaled-linux-amd64 root@HOST:$(TS_INSTALL_DIR)/tailscaled
 2. 复制配置:
    scp config/tailscaled.env      root@HOST:/etc/default/tailscaled
    scp config/tailscaled.service  root@HOST:/etc/systemd/system/tailscaled.service
