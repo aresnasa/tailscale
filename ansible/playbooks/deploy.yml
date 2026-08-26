@@ -137,6 +137,50 @@
       when: ts_platform == 'linux'
       listen: 重启 tailscaled
 
+- name: 自动检测远程节点的内网网段（填充 ts_ignore_routes）
+  # 检测物理网卡的私有 IP，映射到 RFC1918 三大段（10/8, 172.16/12, 192.168/16）。
+  # 仅在 ts_ignore_routes 未被 host_vars 显式设置（为空）时生效，
+  # 避免覆盖用户手动指定的精确网段。
+  hosts: remote
+  become: true
+  gather_facts: false
+  tags: [up, detect]
+  tasks:
+    - name: 安装内网检测脚本
+      ansible.builtin.template:
+        src: detect-lan-cidrs.sh.j2
+        dest: /usr/local/sbin/detect-lan-cidrs.sh
+        mode: "0755"
+
+    - name: 执行检测，获取本机私有网段
+      ansible.builtin.command:
+        cmd: /usr/local/sbin/detect-lan-cidrs.sh
+      register: detected_cidrs
+      changed_when: false
+
+    - name: 检测到的 CIDR 列表写入 fact（若已有显式配置则跳过）
+      ansible.builtin.set_fact:
+        ts_ignore_routes: "{{ detected_cidrs.stdout_lines | select('match', '^[0-9]') | list }}"
+      when:
+        - ts_ignore_routes | default([]) | length == 0
+        - detected_cidrs.stdout_lines | select('match', '^[0-9]') | list | length > 0
+
+    - name: 展示自动检测结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 内网网段检测 ====="
+          - "物理网卡检测到的 CIDR: {{ detected_cidrs.stdout_lines | select('match', '^[0-9]') | list }}"
+          - "最终 ts_ignore_routes: {{ ts_ignore_routes }}"
+      when: ts_ignore_routes | default([]) | length > 0
+
+    - name: 若未检测到私有网段则提示
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: 未检测到物理网卡私有地址"
+          - "ts_ignore_routes 保持为: {{ ts_ignore_routes | default([]) }}"
+          - ">> 如需忽略内网，手动设置 host_vars 的 ts_ignore_routes"
+      when: ts_ignore_routes | default([]) | length == 0
+
 - name: 计算各节点的 tailscale up 命令（按 ts_role）
   hosts: all
   gather_facts: false

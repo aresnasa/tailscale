@@ -59,6 +59,10 @@ ts_exit_node: "mac-mini"
 #   - Tailscale 自身地址（100.64/10）不受影响，tailnet 互通不中断
 # 需要本仓库构建的二进制（上游官方版无此参数）；在每个主机上按需覆盖。
 #
+# 自动检测：deploy.yml 的 detect 阶段会扫描远程节点物理网卡的私有 IP，
+# 自动映射到 RFC1918 三大段（10/8, 172.16/12, 192.168/16）。
+# 默认留空（[]）表示启用自动检测；在 host_vars 手动设置则覆盖自动检测。
+#
 # 注意：--ignore-routes 只处理出方向路由，入方向回包仍会命中 table 52 的 throw/default
 # 导致内网不可达。deploy.yml 会在 tailscale up 后自动运行 lan-access 步骤，
 # 在 ip rule priority 5260（< Tailscale 5270）插入 to <CIDR> lookup main 规则，

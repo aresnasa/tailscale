@@ -72,10 +72,31 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 **首选方案（CIDR 级）**。本仓库 fork 给 tailscale 增加了 `--ignore-routes` 参数（上游官方版没有）：
 指定网段永远不走 Tailscale 隧道，始终用主机自身路由直连，即使在用 exit node。
 
-```yaml
-# inventory/hosts.ini 按主机配置（217 已默认忽略内网三大段）：
-ts_ignore_routes=['10.0.0.0/8','192.168.0.0/16','172.16.0.0/12']
+### 自动检测（推荐）
+
+`deploy.yml` 的 `detect` 阶段会自动扫描远程节点的**物理网卡** IP，
+映射到 RFC1918 三大私有网段，无需手动维护 `ts_ignore_routes`：
+
 ```
+物理网卡 enp1s0: 10.9.202.217/24  →  自动推导 10.0.0.0/8
+物理网卡 eth1:   192.168.1.100/24 →  自动推导 192.168.0.0/16
+```
+
+排除的虚拟接口：`lo`, `tailscale*`, `cilium*`, `kube-ipvs*`, `lxc*`, `docker*`,
+`br-*`, `veth*`, `virbr*`, `vnet*`, `tun*`, `tap*`, `flannel*`, `cni*`, `cali*` 等。
+
+### 手动指定（覆盖自动检测）
+
+在 `inventory/host_vars/<主机>.yml` 设置 `ts_ignore_routes` 即可覆盖自动检测：
+
+```yaml
+# 只忽略精确子网，不忽略整个 10/8
+ts_ignore_routes:
+  - 10.9.202.0/24
+  - 172.16.0.0/12
+```
+
+### 原理
 
 随 `deploy.yml --tags up` 自动下发（首次 up 带参数，后续变更用 `tailscale set --ignore-routes=...` 幂等更新，无需重新登录）。
 
@@ -297,7 +318,8 @@ ansible/
 │   │   ├── tailscaled.service.j2     # linux systemd 单元
 │   │   ├── com.tailscale.tailscaled.plist.j2  # mac launchd daemon
 │   │   ├── tailscale-lan-rules.sh.j2        # 内网绕过 table 52 脚本
-│   │   └── tailscale-lan-rules.service.j2   # 内网规则 systemd service
+│   │   ├── tailscale-lan-rules.service.j2   # 内网规则 systemd service
+│   │   └── detect-lan-cidrs.sh.j2           # 内网网段自动检测脚本
 │   ├── deploy.yml                    # build -> deploy -> up -> lan-access -> verify
 │   ├── verify.yml                    # status + 互 ping + 217 经 Mac 访问 + 内网可达
 │   ├── lan-access.yml                # 内网双向可达（ip rule 5260 绕过 table 52）

@@ -1,7 +1,9 @@
 ---
 # box-217 作为 exit-node-client：内网网段不经 Mac 出网，直接走本机网关。
-# （fork 的 --ignore-routes 原生功能；参见 group_vars/all.yml 注释）
-ts_ignore_routes:
-  - 10.0.0.0/8
-  - 192.168.0.0/16
-  - 172.16.0.0/12
+#
+# ts_ignore_routes 由 deploy.yml 的 detect 阶段自动检测（扫描物理网卡私有 IP），
+# 映射到 RFC1918 三大段。无需在此手动维护。
+#
+# 如需手动指定精确网段（覆盖自动检测），取消下面注释：
+# ts_ignore_routes:
+#   - 10.9.202.0/24    # 只忽略本机直连子网，不忽略整个 10/8
