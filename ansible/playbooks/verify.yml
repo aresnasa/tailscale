@@ -61,8 +61,8 @@
         cmd: >-
           curl -4 -sS -o /dev/null
           -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s'
-          --connect-timeout 5
-          --max-time 15
+          --connect-timeout 10
+          --max-time 30
           {{ item }}
       loop: "{{ test_urls }}"
       register: curl_results
@@ -110,9 +110,9 @@
       failed_when: false
       when: lan_gw.stdout | length > 0
 
-    - name: 获取本机物理 IP（非 tailscale0）
+    - name: 获取本机物理 IP（非 tailscale0/lo）
       ansible.builtin.shell: |
-        ip -4 addr show | grep -v tailscale | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | head -1
+        ip -4 addr show | grep -vE 'tailscale|lo:|lo\s' | grep 'inet ' | grep -v '127\.0\.0\.1' | awk '{print $2}' | cut -d/ -f1 | head -1
       register: lan_ip
       changed_when: false
       failed_when: false

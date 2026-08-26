@@ -31,16 +31,41 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 
 以下命令都在 `ansible/` 目录下执行（Mac 非 root 部署，无需 `-K`）：
 
+### 分阶段部署（推荐）
+
 ```sh
-# 1. 全量：构建 -> 部署 -> up（Mac 先广播 exit node，217 再引用）-> 验证
-./.venv/bin/ansible-playbook playbooks/deploy.yml
+# 阶段 1: 构建并安装二进制 + 启动 daemon（不涉及登录/配置，最快）
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags build,install
 
-# 2. 带 auth key 一键 tailscale up（真正打通两机 + 出口路由）
-./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxxxxxxx
+# 阶段 2: 检测内网网段 + 配置 exit node + lan-access（需先完成登录）
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,up,lan
 
-# 3. 随时验证两机状态 & 217 经 Mac 访问 GitHub
+# 阶段 3: 验证连通性（tailscale status + 内网 ping + 外网 curl）
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags verify
+# 或用专门的验证 playbook
 ./.venv/bin/ansible-playbook playbooks/verify.yml
 ```
+
+### 全量一键
+
+```sh
+# 全量部署（build → install → detect → up → lan → verify）
+./.venv/bin/ansible-playbook playbooks/deploy.yml
+
+# 带 auth key 自动注册（无需手动浏览器认证）
+./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxxxxxxx
+```
+
+### Tag 说明
+
+| Tag | 阶段 | 说明 |
+|---|---|---|
+| `build` | 1a | 交叉编译 darwin/arm64 + linux/amd64 二进制 |
+| `install` | 1b | 分发二进制 + 生成配置 + 启动 daemon |
+| `detect` | 2 | 检测远程节点物理网卡私有 IP → 填充 ts_ignore_routes |
+| `up` | 3 | tailscale up（Mac 广播 exit node，客户端指向 Mac）|
+| `lan` | 3 | 配置 ip rule 5260 绕过 table 52（内网双向可达）|
+| `verify` | 4 | 验证：tailscale status + 内网 ping + 外网 curl |
 
 ### 出口节点（exit node）注意事项
 

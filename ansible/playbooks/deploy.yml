@@ -1,15 +1,35 @@
 ---
-# 部署 tailscaled + tailscale 到 本机 Mac 和 远程 Linux，并验证连通
+# 部署 tailscaled + tailscale 到 本机 Mac 和 远程 Linux
+#
+# 分阶段设计，支持按 tag 单独执行：
+#   build   — 交叉编译二进制（仅本机）
+#   install — 分发二进制 + 生成配置 + 启动 daemon
+#   detect  — 检测远程节点内网网段，填充 ts_ignore_routes
+#   up      — tailscale up（Mac 广播 exit node，客户端指向 Mac）
+#   lan     — 配置内网绕过 table 52 的 ip rule
+#   verify  — 验证连通性（tailscale status + 内网 ping + 外网 curl）
 #
 # 用法:
 #   cd ansible
-#   ansible-playbook playbooks/deploy.yml -K                             # 部署 + 本地验证
-#   ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-xxx     # 顺带 tailscale up 加入 tailnet
+#   # 阶段 1: 构建并安装（不涉及登录/配置）
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags build,install
 #
-# 单步执行: --tags build | deploy | up | verify
-
-# deploy.yml 由 playbook_dir 相对定位变量与产物
+#   # 阶段 2: 检测内网 + 配置 exit node + lan-access（需要先登录）
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,up,lan
+#
+#   # 阶段 3: 验证
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags verify
+#   # 或直接用专门的验证 playbook
+#   ./.venv/bin/ansible-playbook playbooks/verify.yml
+#
+#   # 全量一键（带 authkey 自动注册）
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx
+#
 # 共用变量位于 playbooks/group_vars/all.yml（Ansible 自动加载 playbook 同级 group_vars）
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 1a: 构建二进制（仅本机交叉编译）
+# ═══════════════════════════════════════════════════════════════
 - name: 构建两个平台的二进制（在本机交叉编译）
   hosts: localhost
   gather_facts: false
@@ -49,12 +69,14 @@
         fail_msg: "缺少构建产物 {{ item.stat.path }}"
       loop: "{{ artifacts.results }}"
 
-- name: 分发并安装 tailscaled/tailscale
+# ═══════════════════════════════════════════════════════════════
+# 阶段 1b: 分发二进制 + 生成配置 + 启动 daemon
+# ═══════════════════════════════════════════════════════════════
+- name: 安装 tailscaled/tailscale 并启动 daemon
   hosts: all
   become: "{{ ts_become | bool }}"
   gather_facts: false
-  # mac 走用户级 launchd（非 root），linux 走 systemd（root）
-  tags: [deploy]
+  tags: [install]
   tasks:
     - name: 安装 tailscale / tailscaled 二进制（按平台选产物）
       ansible.builtin.copy:
@@ -112,15 +134,30 @@
       when: ts_platform == 'darwin'
       changed_when: false
 
+    # ---- 等待 daemon 就绪 ----
+    - name: 等待 tailscaled daemon 就绪
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: daemon_ready
+      changed_when: false
+      failed_when: false
+      retries: 5
+      delay: 2
+      until: daemon_ready.rc == 0 or 'Logged out' in (daemon_ready.stdout | default(''))
+
+    - name: 输出 daemon 状态
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} daemon 就绪 ====="
+          - "{{ daemon_ready.stdout_lines | default(daemon_ready.stderr_lines | default(['无输出'])) }}"
+
   handlers:
-    # plist 变更时先卸载旧服务；未装载时 bootout 报错属正常，忽略
     - name: 重装 launchd tailscaled
       ansible.builtin.shell:
         cmd: launchctl bootout gui/$(id -u)/com.tailscale.tailscaled
       when: ts_platform == 'darwin'
       ignore_errors: true
 
-    # 已装载则 kickstart 重启，未装载则 bootstrap 装载；必须在 bootout 之后执行
     - name: 重启 tailscaled
       ansible.builtin.shell:
         cmd: >-
@@ -137,14 +174,16 @@
       when: ts_platform == 'linux'
       listen: 重启 tailscaled
 
-- name: 自动检测远程节点的内网网段（填充 ts_ignore_routes）
-  # 检测物理网卡的私有 IP，映射到 RFC1918 三大段（10/8, 172.16/12, 192.168/16）。
-  # 仅在 ts_ignore_routes 未被 host_vars 显式设置（为空）时生效，
-  # 避免覆盖用户手动指定的精确网段。
+# ═══════════════════════════════════════════════════════════════
+# 阶段 2: 检测远程节点内网网段（填充 ts_ignore_routes）
+# ═══════════════════════════════════════════════════════════════
+- name: 检测远程节点内网网段（填充 ts_ignore_routes）
+  # 扫描物理网卡的私有 IP，映射到 RFC1918 三大段（10/8, 172.16/12, 192.168/16）。
+  # 仅在 ts_ignore_routes 未被 host_vars 显式设置（为空）时生效。
   hosts: remote
   become: true
   gather_facts: false
-  tags: [up, detect]
+  tags: [detect]
   tasks:
     - name: 安装内网检测脚本
       ansible.builtin.template:
@@ -181,6 +220,9 @@
           - ">> 如需忽略内网，手动设置 host_vars 的 ts_ignore_routes"
       when: ts_ignore_routes | default([]) | length == 0
 
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3a: 计算 up 命令（所有节点）
+# ═══════════════════════════════════════════════════════════════
 - name: 计算各节点的 tailscale up 命令（按 ts_role）
   hosts: all
   gather_facts: false
@@ -198,10 +240,13 @@
           {% endif %}
           {{ ts_up_extra_args }}
 
-    - name: 预览将执行的 up 命令（未提供 authkey 时仅展示，便于人工执行）
+    - name: 预览将执行的 up 命令
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} [{{ ts_role | default('default') }}]: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}"
 
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3b: 出口节点 up（Mac 广播 exit node）
+# ═══════════════════════════════════════════════════════════════
 - name: 出口节点 up（Mac 广播 exit node）
   hosts: local
   become: "{{ ts_become | bool }}"
@@ -216,17 +261,7 @@
       changed_when: true
       when: ts_authkey | length > 0
 
-    # ---- 无 authkey：尝试 up，捕获登录 URL ----
-    # 用 timeout 15s 运行，超时后 tailscaled 会在后台继续等待认证
-    # 输出重定向到临时文件，避免 ansible 卡住
-    - name: tailscale up --advertise-exit-node（无 authkey，捕获登录 URL）
-      ansible.builtin.shell: |
-        timeout 15 {{ ts_up_cmd }} 2>&1 || true
-      register: up_mac_nologin
-      changed_when: false
-      failed_when: false
-      when: ts_authkey | length == 0
-
+    # ---- 无 authkey：检查是否已登录 ----
     - name: 检查 Mac 是否已登录
       ansible.builtin.command:
         cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
@@ -235,35 +270,39 @@
       failed_when: false
       when: ts_authkey | length == 0
 
+    # ---- 未登录：尝试 up 捕获 URL ----
+    - name: tailscale up（未登录时捕获登录 URL）
+      ansible.builtin.shell: |
+        timeout 15 {{ ts_up_cmd }} 2>&1 || true
+      register: up_mac_nologin
+      changed_when: false
+      failed_when: false
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' in (mac_status.stdout | default(''))"
+
     - name: 输出 Mac 登录指引
       ansible.builtin.debug:
         msg: |
           ╔══════════════════════════════════════════════════════════════╗
           ║  Mac-mini (exit node) 需要登录认证                            ║
           ╠══════════════════════════════════════════════════════════════╣
-          {% if 'login.tailscale.com' in (up_mac_nologin.stdout | default('')) or 'login.tailscale.com' in (up_mac_nologin.stderr | default('')) %}
-          ║                                                              ║
+          {% if 'login.tailscale.com' in (up_mac_nologin.stdout | default('')) %}
           ║  请在浏览器打开以下链接完成认证：                              ║
-          ║                                                              ║
-          ║  {{ (up_mac_nologin.stdout ~ up_mac_nologin.stderr) | regex_search('https://login\.tailscale\.com/[^ ]+') }} ║
-          ║                                                              ║
+          ║  {{ (up_mac_nologin.stdout) | regex_search('https://login\\.tailscale\\.com/[^ ]+') }}
           ║  授权后 Mac 会自动加入 tailnet 并广播 exit node。            ║
-          {% elif 'Logged out' in (mac_status.stdout | default('')) %}
-          ║                                                              ║
-          ║  Mac 尚未登录。请手动执行：                                    ║
-          ║  {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
-          ║                                                              ║
-          ║  或提供 authkey 自动注册：                                    ║
-          ║  ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
           {% else %}
-          ║                                                              ║
           ║  Mac 状态: {{ mac_status.stdout_lines | default(['未知']) }}
-          ║  up 输出: {{ up_mac_nologin.stdout_lines | default([]) }}
-          ║  up 错误: {{ up_mac_nologin.stderr_lines | default([]) }}
+          ║  如需登录: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
           {% endif %}
           ╚══════════════════════════════════════════════════════════════╝
-      when: ts_authkey | length == 0
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' in (mac_status.stdout | default(''))"
 
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3c: 客户端 up 并指向 Mac 作为 exit node
+# ═══════════════════════════════════════════════════════════════
 - name: 客户端 up 并指向 Mac 作为 exit node
   hosts: remote
   become: "{{ ts_become | bool }}"
@@ -279,15 +318,7 @@
       failed_when: false
       when: ts_authkey | length > 0
 
-    # ---- 无 authkey：尝试 up，捕获登录 URL ----
-    - name: tailscale up --exit-node（无 authkey，捕获登录 URL）
-      ansible.builtin.shell: |
-        timeout 15 {{ ts_up_cmd }} 2>&1 || true
-      register: up_client_nologin
-      changed_when: false
-      failed_when: false
-      when: ts_authkey | length == 0
-
+    # ---- 无 authkey：检查是否已登录 ----
     - name: 检查客户端是否已登录
       ansible.builtin.command:
         cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
@@ -296,40 +327,41 @@
       failed_when: false
       when: ts_authkey | length == 0
 
+    # ---- 未登录：尝试 up 捕获 URL ----
+    - name: tailscale up（未登录时捕获登录 URL）
+      ansible.builtin.shell: |
+        timeout 15 {{ ts_up_cmd }} 2>&1 || true
+      register: up_client_nologin
+      changed_when: false
+      failed_when: false
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' in (client_status.stdout | default(''))"
+
     - name: 输出客户端登录指引
       ansible.builtin.debug:
         msg: |
           ╔══════════════════════════════════════════════════════════════╗
           ║  {{ inventory_hostname }} (exit node client) 需要登录认证    ║
           ╠══════════════════════════════════════════════════════════════╣
-          {% if 'login.tailscale.com' in (up_client_nologin.stdout | default('')) or 'login.tailscale.com' in (up_client_nologin.stderr | default('')) %}
-          ║                                                              ║
+          {% if 'login.tailscale.com' in (up_client_nologin.stdout | default('')) %}
           ║  请在浏览器打开以下链接完成认证：                              ║
-          ║                                                              ║
-          ║  {{ (up_client_nologin.stdout ~ up_client_nologin.stderr) | regex_search('https://login\.tailscale\.com/[^ ]+') }} ║
-          ║                                                              ║
+          ║  {{ (up_client_nologin.stdout) | regex_search('https://login\\.tailscale\\.com/[^ ]+') }}
           ║  授权后客户端会自动加入 tailnet 并通过 Mac 出网。            ║
-          {% elif 'Logged out' in (client_status.stdout | default('')) %}
-          ║                                                              ║
-          ║  客户端尚未登录。请手动执行：                                  ║
-          ║  {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
-          ║                                                              ║
-          ║  或提供 authkey 自动注册：                                    ║
-          ║  ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
           {% else %}
-          ║                                                              ║
           ║  客户端状态: {{ client_status.stdout_lines | default(['未知']) }}
           ║  up 输出: {{ up_client_nologin.stdout_lines | default([]) }}
-          ║  up 错误: {{ up_client_nologin.stderr_lines | default([]) }}
           {% endif %}
           ║                                                              ║
           ║  ⚠ 若提示 exit node 不可用：                                 ║
           ║    1. 确保 Mac 已认证并 up --advertise-exit-node              ║
           ║    2. 到管理后台 Machines → Mac → Edit route settings        ║
           ║       勾选 'Use as exit node' → Save                         ║
-          ║    3. 重跑: ansible-playbook playbooks/deploy.yml --tags up  ║
+          ║    3. 重跑: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up
           ╚══════════════════════════════════════════════════════════════╝
-      when: ts_authkey | length == 0
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' in (client_status.stdout | default(''))"
 
     - name: 若客户端 up 失败（authkey 模式），提示去管理后台审批
       ansible.builtin.debug:
@@ -337,9 +369,9 @@
           ╔══════════════════════════════════════════════════════════════╗
           ║  {{ inventory_hostname }} up 失败 — exit node 未审批        ║
           ╠══════════════════════════════════════════════════════════════╣
-          ║  rc={{ up_client.rc | default('?') }}                        ║
-          ║  输出: {{ up_client.stdout_lines | default([]) }}           ║
-          ║  错误: {{ up_client.stderr_lines | default([]) }}           ║
+          ║  rc={{ up_client.rc | default('?') }}
+          ║  输出: {{ up_client.stdout_lines | default([]) }}
+          ║  错误: {{ up_client.stderr_lines | default([]) }}
           ║                                                              ║
           ║  >> exit node 必须在管理后台一次性审批：                      ║
           ║     https://login.tailscale.com/admin/machines               ║
@@ -351,11 +383,14 @@
           ╚══════════════════════════════════════════════════════════════╝
       when: (ts_authkey | length > 0) and (up_client.rc | default(1) != 0)
 
-- name: 应用路由忽略配置（幂等；不重新 up 也能变更）
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3d: 应用路由忽略配置 + 内网绕过 table 52
+# ═══════════════════════════════════════════════════════════════
+- name: 应用路由忽略配置（幂等）
   hosts: all
   become: "{{ ts_become | bool }}"
   gather_facts: false
-  tags: [up]
+  tags: [up, lan]
   tasks:
     - name: tailscale set --ignore-routes
       ansible.builtin.command:
@@ -363,24 +398,23 @@
       when: ts_ignore_routes | default([]) | length > 0
       register: set_ignore
       changed_when: set_ignore.rc | default(1) == 0
-      failed_when: false # 未登录/daemon 未起时 rc!=0 属预期，下面统一提示
+      failed_when: false
 
     - name: 若 set 失败给出提示
       ansible.builtin.debug:
         msg:
           - "{{ inventory_hostname }}: set --ignore-routes rc={{ set_ignore.rc | default('skipped') }}"
           - "{{ set_ignore.stderr_lines | default([]) }}"
-          - ">> 若 daemon 未部署/未登录，先跑 --tags deploy 或带 ts_authkey 的 up。"
+          - ">> 若 daemon 未部署/未登录，先跑 --tags install 或带 ts_authkey 的 up。"
       when: (set_ignore.rc | default(0)) != 0
 
-- name: 配置内网绕过 table 52（exit node 场景下保证内网双向可达）
-  # 问题：--ignore-routes 让出方向内网走 main 表，但入方向回包仍命中 table 52
-  # 的 throw/default → 丢弃或走隧道 → 内网不可达。
-  # 解法：ip rule priority 5260（< Tailscale 5270）插 to <CIDR> lookup main
+- name: 配置内网绕过 table 52（ip rule 5260）
+  # --ignore-routes 只处理出方向，入方向回包仍命中 table 52 的 throw/default。
+  # 在 ip rule priority 5260（< Tailscale 5270）插 to <CIDR> lookup main 规则。
   hosts: remote
   become: true
   gather_facts: false
-  tags: [up, lan]
+  tags: [lan]
   tasks:
     - name: 创建 /etc/tailscale 目录
       ansible.builtin.file:
@@ -426,19 +460,16 @@
       register: lan_rules_apply
       changed_when: "'已添加' in lan_rules_apply.stdout"
 
-    - name: 查看 ip rule 和 table 52 状态
-      ansible.builtin.command:
-        cmd: /usr/local/sbin/tailscale-lan-rules.sh status
-      register: lan_rules_status
-      changed_when: false
-
     - name: 输出 lan-access 状态
       ansible.builtin.debug:
         msg:
           - "===== {{ inventory_hostname }} 内网绕过 table 52 配置 ====="
           - "忽略网段: {{ ts_ignore_routes | default([]) }}"
-          - "{{ lan_rules_status.stdout_lines }}"
+          - "{{ lan_rules_apply.stdout_lines | default([]) }}"
 
+# ═══════════════════════════════════════════════════════════════
+# 阶段 4: 验证连通性
+# ═══════════════════════════════════════════════════════════════
 - name: 验证 daemon 与 CLI 连通
   hosts: all
   become: "{{ ts_become | bool }}"
@@ -451,7 +482,7 @@
       loop: [version, status]
       register: verify
       changed_when: false
-      failed_when: false # 未登录时 rc=1 属预期（Logged out.），不算失败
+      failed_when: false
 
     - name: 记录 tailscale status 结果（供总结使用）
       ansible.builtin.set_fact:
@@ -466,7 +497,95 @@
       loop_control:
         label: "{{ item.item }}"
 
-- name: 部署总结与下一步指引
+- name: 验证 217 内网双向可达（exit node 不破坏内网访问）
+  hosts: remote
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: 获取物理网卡默认网关（非 tailscale0）
+      ansible.builtin.shell: |
+        ip -4 route show default | grep -v tailscale | awk '{print $3}' | head -1
+      register: lan_gw
+      changed_when: false
+      failed_when: false
+
+    - name: ping 内网网关（验证出方向内网直连）
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 2 {{ lan_gw.stdout }}"
+      register: gw_ping
+      changed_when: false
+      failed_when: false
+      when: lan_gw.stdout | length > 0
+
+    - name: 获取本机物理 IP（非 tailscale0/lo）
+      ansible.builtin.shell: |
+        ip -4 addr show | grep -vE 'tailscale|lo:|lo\s' | grep 'inet ' | grep -v '127\.0\.0\.1' | awk '{print $2}' | cut -d/ -f1 | head -1
+      register: lan_ip
+      changed_when: false
+      failed_when: false
+
+    - name: 查看内网 ip rule 配置
+      ansible.builtin.shell: |
+        echo "=== ip rule (5260 lan-access) ==="
+        ip rule show | grep '^5260:' || echo '(无 lan-access 规则)'
+        echo ""
+        echo "=== table 52 throw/default ==="
+        ip route show table 52 | grep -E '^(throw|default)' || echo '(无)'
+      register: lan_rules_check
+      changed_when: false
+
+    - name: 输出内网连通性验证
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} 内网双向可达验证 ====="
+          - "物理 IP: {{ lan_ip.stdout | default('(未检测到)') }}"
+          - "内网网关: {{ lan_gw.stdout | default('(未检测到)') }}"
+          - "网关 ping: {{ '✓ 可达' if (gw_ping.rc | default(1)) == 0 else '✗ 不可达' }}"
+          - ""
+          - "{{ lan_rules_check.stdout_lines }}"
+
+- name: 验证 217 经 Mac exit node 访问外网
+  hosts: remote
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tags: [verify]
+  vars:
+    test_urls:
+      - https://github.com
+      - https://www.google.com
+  tasks:
+    - name: 批量 curl 测试 URL（流量应经 exit node 转发）
+      ansible.builtin.command:
+        cmd: >-
+          curl -4 -sS -o /dev/null
+          -w 'HTTP %{http_code} from %{remote_ip} in %{time_total}s'
+          --connect-timeout 10
+          --max-time 30
+          {{ item }}
+      loop: "{{ test_urls }}"
+      register: curl_results
+      changed_when: false
+      failed_when: false
+
+    - name: 输出外网访问结果
+      ansible.builtin.debug:
+        msg: |
+          ===== {{ inventory_hostname }} 经 Mac exit node 访问测试 =====
+          测试 URL 列表: {{ test_urls }}
+          {% for r in curl_results.results %}
+          217 -> {{ r.item }}:
+            {{ r.stdout | default(r.stderr) | trim }}
+          {% endfor %}
+          {% set ok = curl_results.results | selectattr('rc', 'equalto', 0) | list %}
+          汇总: {{ ok | length }}/{{ curl_results.results | length }} 成功
+          若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。
+          若 google 等被墙站点失败：确认 Mac 已配置 ts_forward_proxy 指向 Clash Verge。
+
+# ═══════════════════════════════════════════════════════════════
+# 部署总结
+# ═══════════════════════════════════════════════════════════════
+- name: 部署总结
   hosts: localhost
   gather_facts: false
   tags: [up, verify]
