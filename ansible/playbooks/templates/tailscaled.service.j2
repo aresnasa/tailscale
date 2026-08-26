@@ -1,0 +1,21 @@
+[Unit]
+Description=Tailscale node agent
+Documentation=https://tailscale.com/docs/
+Wants=network-pre.target
+After=network-pre.target NetworkManager.service systemd-resolved.service
+
+[Service]
+EnvironmentFile=/etc/default/tailscaled
+ExecStart={{ ts_install_dir }}/tailscaled --statedir=${TS_STATE_DIR} --socket=${TS_SOCKET} --port=${TS_PORT} $FLAGS
+ExecStopPost={{ ts_install_dir }}/tailscaled --cleanup --statedir=${TS_STATE_DIR}
+Restart=on-failure
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+StateDirectory=tailscale
+StateDirectoryMode=0700
+CacheDirectory=tailscale
+CacheDirectoryMode=0750
+Type=notify
+
+[Install]
+WantedBy=multi-user.target

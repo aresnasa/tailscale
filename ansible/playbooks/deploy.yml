@@ -1,0 +1,171 @@
+---
+# 部署 tailscaled + tailscale 到 本机 Mac 和 远程 Linux，并验证连通
+#
+# 用法:
+#   cd ansible
+#   ansible-playbook playbooks/deploy.yml -K                             # 部署 + 本地验证
+#   ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-xxx     # 顺带 tailscale up 加入 tailnet
+#
+# 单步执行: --tags build | deploy | up | verify
+
+# deploy.yml 由 playbook_dir 相对定位变量与产物
+# 共用变量位于 playbooks/group_vars/all.yml（Ansible 自动加载 playbook 同级 group_vars）
+- name: 构建两个平台的二进制（在本机交叉编译）
+  hosts: localhost
+  gather_facts: false
+  tags: [build]
+  pre_tasks:
+    - name: 确保 dist 目录存在
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../../dist"
+        state: directory
+        mode: "0755"
+
+  tasks:
+    - name: make build（darwin/arm64 + linux/amd64）
+      ansible.builtin.command:
+        cmd: "{{ item }}"
+        chdir: "{{ playbook_dir }}/../.."
+      loop:
+        - make build GOOS=darwin GOARCH=arm64
+        - make build GOOS=linux GOARCH=amd64
+      register: build_result
+      changed_when: true
+      failed_when: build_result.rc != 0
+
+    - name: 校验构建产物齐全
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../../dist/{{ item }}"
+      loop:
+        - tailscale-darwin-arm64
+        - tailscaled-darwin-arm64
+        - tailscale-linux-amd64
+        - tailscaled-linux-amd64
+      register: artifacts
+
+    - name: 缺少产物则中止
+      ansible.builtin.assert:
+        that: "{{ item.stat.exists }}"
+        fail_msg: "缺少构建产物 {{ item.stat.path }}"
+      loop: "{{ artifacts.results }}"
+
+- name: 分发并安装 tailscaled/tailscale
+  hosts: all
+  become: true
+  # mac 走 launchd、linux 走 systemd，由清单里的 ts_platform 区分
+  tags: [deploy]
+  tasks:
+    - name: 安装 tailscale / tailscaled 二进制（按平台选产物）
+      ansible.builtin.copy:
+        src: "{{ ts_dist_dir }}/{{ item }}-{{ ts_goos }}-{{ ts_goarch }}"
+        dest: "{{ ts_install_dir }}/{{ item }}"
+        mode: "0755"
+      loop: [tailscale, tailscaled]
+      notify: 重启 tailscaled
+
+    - name: 生成共享配置 /etc/default/tailscaled
+      ansible.builtin.template:
+        src: tailscaled.env.j2
+        dest: /etc/default/tailscaled
+        mode: "0644"
+
+    # ---- Linux: systemd ----
+    - name: "[linux] 安装 tailscaled.service"
+      ansible.builtin.template:
+        src: tailscaled.service.j2
+        dest: /etc/systemd/system/tailscaled.service
+        mode: "0644"
+      when: ts_platform == 'linux'
+      notify: 重启 tailscaled
+
+    - name: "[linux] daemon-reload 并启动 tailscaled"
+      ansible.builtin.systemd:
+        name: tailscaled
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: ts_platform == 'linux'
+
+    # ---- macOS: launchd ----
+    - name: "[mac] 安装 launchd plist"
+      ansible.builtin.template:
+        src: com.tailscale.tailscaled.plist.j2
+        dest: /Library/LaunchDaemons/com.tailscale.tailscaled.plist
+        owner: root
+        group: wheel
+        mode: "0644"
+      when: ts_platform == 'darwin'
+      notify:
+        - 重装 launchd tailscaled
+        - 重启 tailscaled
+
+    - name: "[mac] 确保 tailscaled 已启动"
+      ansible.builtin.command:
+        cmd: >-
+          sh -c 'launchctl print system/com.tailscale.tailscaled >/dev/null 2>&1
+          || launchctl bootstrap system /Library/LaunchDaemons/com.tailscale.tailscaled.plist'
+      when: ts_platform == 'darwin'
+      changed_when: false
+
+  handlers:
+    # plist 变更时先卸载旧服务；未装载时 bootout 报错属正常，忽略
+    - name: 重装 launchd tailscaled
+      ansible.builtin.command:
+        cmd: launchctl bootout system/com.tailscale.tailscaled
+      when: ts_platform == 'darwin'
+      ignore_errors: true
+
+    # 已装载则 kickstart 重启，未装载则 bootstrap 装载；必须在 bootout 之后执行
+    - name: 重启 tailscaled
+      ansible.builtin.command:
+        cmd: >-
+          sh -c 'launchctl kickstart -k system/com.tailscale.tailscaled 2>/dev/null
+          || launchctl bootstrap system /Library/LaunchDaemons/com.tailscale.tailscaled.plist'
+      when: ts_platform == 'darwin'
+      listen: 重启 tailscaled
+
+    - name: "[linux] 重启 tailscaled"
+      ansible.builtin.systemd:
+        name: tailscaled
+        state: restarted
+        daemon_reload: true
+      when: ts_platform == 'linux'
+      listen: 重启 tailscaled
+
+- name: 可选：tailscale up 加入 tailnet（提供 ts_authkey 时）
+  hosts: all
+  become: true
+  tags: [up]
+  tasks:
+    - name: tailscale up
+      ansible.builtin.command:
+        cmd: >-
+          {{ ts_install_dir }}/tailscale --socket={{ ts_socket }} up
+          --auth-key={{ ts_authkey }} --hostname={{ inventory_hostname }}
+          {{ ts_up_extra_args }}
+      register: up_result
+      changed_when: true
+      failed_when: up_result.rc != 0
+      when: ts_authkey | length > 0
+
+- name: 验证 daemon 与 CLI 连通
+  hosts: all
+  become: true
+  tags: [verify]
+  tasks:
+    - name: tailscale version / status
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} {{ item }}"
+      loop: [version, status]
+      register: verify
+      changed_when: false
+      failed_when: false # 未登录时 rc=1 属预期（Logged out.），不算失败
+
+    - name: 输出验证结果
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} : tailscale {{ item.item }} ====="
+          - "{{ item.stdout_lines | default(item.stderr_lines) }}"
+      loop: "{{ verify.results }}"
+      loop_control:
+        label: "{{ item.item }}"

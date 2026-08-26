@@ -1,0 +1,13 @@
+# 仅供本地 mock 测试使用，不参与真正部署
+# 覆盖 group_vars 里默认的 ts_api_base（production api.tailscale.com）
+ts_api_key: mock-key-for-test
+ts_api_base: "http://127.0.0.1:8765/api/v2"
+ts_tailnet: "-"
+ts_users:
+  - email: new-user@example.com
+    role: member
+  - email: existing@example.com
+    role: member
+ts_users_absent:
+  - old@example.com
+  - nobody@example.com

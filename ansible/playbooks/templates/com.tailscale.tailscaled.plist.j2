@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tailscale.tailscaled</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>mkdir -p {{ ts_state_dir }} {{ ts_socket_dir }} &amp;&amp; exec {{ ts_install_dir }}/tailscaled --statedir={{ ts_state_dir }} --socket={{ ts_socket }} --port={{ ts_port }}</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/tailscaled.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/tailscaled.err.log</string>
+</dict>
+</plist>

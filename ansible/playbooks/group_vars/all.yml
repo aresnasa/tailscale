@@ -1,0 +1,40 @@
+# 两节点共用的 Tailscale 部署变量
+# 与 Makefile 的 TS_* 默认值保持一致（tailscaled 与 CLI 靠同一个 socket 连通）
+
+ts_install_dir: /usr/local/bin
+ts_state_dir: /var/lib/tailscale
+ts_socket_dir: /var/run/tailscale
+ts_socket: "{{ ts_socket_dir }}/tailscaled.sock"
+ts_port: 41641
+
+# 构建产物来源（相对 ansible/ 目录）
+ts_dist_dir: "{{ playbook_dir }}/../../dist"
+
+# 可选：提供 Tailscale auth key 后，playbook 会自动 tailscale up 加入 tailnet。
+# 未提供时仅部署 + 验证 daemon/CLI 连通，稍后手动 `tailscale up`。
+#   ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-auth-xxx
+ts_authkey: ""
+
+# 追加给 tailscale up 的额外参数（如 --advertise-exit-node）
+ts_up_extra_args: ""
+
+# ---- 控制面管理（playbooks/control.yml：ACL + 用户）----
+# Tailscale API 访问令牌（Settings > Keys 生成 tskey-api-...）。
+# 推荐通过环境变量传入，避免写入命令行历史：
+#   TS_API_KEY=tskey-api-xxx ./.venv/bin/ansible-playbook playbooks/control.yml
+ts_api_key: "{{ lookup('ansible.builtin.env', 'TS_API_KEY', default='') }}"
+ts_tailnet: "-" # '-' 表示默认 tailnet；也可填 org 名如 example.com
+ts_api_base: "https://api.tailscale.com/api/v2"
+
+# ACL 策略文件（严格要求合法 JSON、无注释，用于与远端做幂等对比）
+ts_acl_file: "{{ playbook_dir }}/acl/acl.json"
+ts_acl_validate: true # 提交前先调用 /acl/validate 服务端校验
+
+# 期望存在的用户（缺失则创建/邀请）；role: member/admin/owner/auditor...
+ts_users: []
+#  - email: alice@example.com
+#    role: member
+
+# 期望删除的用户（按 loginName/email 匹配后 DELETE）
+ts_users_absent: []
+#  - bob@example.com

@@ -1,0 +1,154 @@
+---
+# Tailnet 控制面管理：ACL 策略 + 用户增删
+# 通过 Tailscale API（v2）操作，全部任务在控制节点本地执行，不接触节点机器。
+#
+# 用法:
+#   export TS_API_KEY=tskey-api-xxxxxxxx        # Settings > Keys 生成
+#   ./.venv/bin/ansible-playbook playbooks/control.yml              # ACL + 用户
+#   ./.venv/bin/ansible-playbook playbooks/control.yml --tags acl   # 仅 ACL 对比+推送
+#   ./.venv/bin/ansible-playbook playbooks/control.yml --tags users # 仅用户增删
+#
+# 行为:
+#   acl   - GET 当前 ACL -> 与 playbooks/acl/acl.json 做 JSON 幂等对比
+#           -> 有差异时先 POST .../acl/validate 校验 -> PUT 提交（带 If-Match ETag）
+#   users - ts_users 中缺失的邮箱 POST 创建(邀请)；ts_users_absent 中的 DELETE
+#
+# 未提供 TS_API_KEY 时全部优雅跳过（本 playbook 不会接触节点）。
+
+- name: Tailnet 控制面管理
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: 未提供 TS_API_KEY 则跳过控制面管理
+      ansible.builtin.debug:
+        msg: "TS_API_KEY 为空，跳过 ACL/用户管理（export TS_API_KEY=tskey-api-xxx 后重试）"
+      when: ts_api_key | length == 0
+
+    # ==================== ACL ====================
+    - name: ACL 策略管理
+      when: ts_api_key | length > 0
+      tags: [acl]
+      block:
+        - name: 读取本地 ACL 文件
+          ansible.builtin.slurp:
+            src: "{{ ts_acl_file }}"
+          register: acl_local
+
+        - name: GET 当前远端 ACL
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/acl"
+            method: GET
+            return_content: true
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+              Accept: application/json
+            status_code: 200
+          register: acl_current
+
+        - name: 本地与远端 ACL 幂等对比（按 JSON 语义，忽略格式差异）
+          ansible.builtin.set_fact:
+            acl_changed:
+              "{{ (acl_current.json | default(acl_current.content | from_json))
+              != (acl_local.content | b64decode | from_json) }}"
+
+        - name: ACL 无变化时跳过推送
+          ansible.builtin.debug:
+            msg: "远端 ACL 与 {{ ts_acl_file }} 一致，无需更新"
+          when: not acl_changed | bool
+
+        - name: 提示即将推送的差异
+          ansible.builtin.debug:
+            msg: "远端 ACL 与本地文件不一致，将执行 validate + PUT"
+          when: acl_changed | bool
+
+        - name: 服务端校验 ACL（不实际生效）
+          when: (acl_changed | bool) and ts_acl_validate
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/acl/validate"
+            method: POST
+            body: "{{ acl_local.content | b64decode | from_json }}"
+            body_format: json
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+            status_code: 200
+          register: acl_validate
+
+        - name: 推送 ACL 到 tailnet
+          when: acl_changed | bool
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/acl"
+            method: PUT
+            body: "{{ acl_local.content | b64decode | from_json }}"
+            body_format: json
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+              If-Match: "{{ acl_current.etag | default(omit) }}"
+            status_code: 200
+          register: acl_put
+
+    # ==================== 用户 ====================
+    - name: 用户增删管理
+      when: ts_api_key | length > 0
+      tags: [users]
+      block:
+        - name: GET 当前 tailnet 用户列表
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/users"
+            method: GET
+            return_content: true
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+            status_code: 200
+          register: users_current
+
+        - name: 规范化用户列表
+          ansible.builtin.set_fact:
+            users_list: "{{ users_current.json if users_current.json is defined else (users_current.content | from_json) }}"
+
+        - name: 创建缺失的用户（ts_users 中存在但远端没有）
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/users"
+            method: POST
+            body:
+              email: "{{ item.email }}"
+              role: "{{ item.role | default('member') }}"
+            body_format: json
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+            status_code: [200, 201, 202]
+          loop: "{{ ts_users }}"
+          when: users_list | selectattr('loginName', 'equalto', item.email) | list | length == 0
+          register: users_created
+          loop_control:
+            label: "{{ item.email }}"
+
+        - name: 列出本就存在、无需创建的用户
+          ansible.builtin.debug:
+            msg: "{{ item.email }} 已存在，跳过创建"
+          loop: "{{ ts_users }}"
+          when: users_list | selectattr('loginName', 'equalto', item.email) | list | length > 0
+          loop_control:
+            label: "{{ item.email }}"
+
+        - name: 求出待删除用户的 id（ts_users_absent ∩ 远端存在）
+          ansible.builtin.set_fact:
+            users_to_delete: "{{ users_list | selectattr('loginName', 'in', ts_users_absent) | list }}"
+
+        - name: 删除 ts_users_absent 中列出的用户
+          ansible.builtin.uri:
+            url: "{{ ts_api_base }}/tailnet/{{ ts_tailnet }}/users/{{ item.id }}"
+            method: DELETE
+            headers:
+              Authorization: "Bearer {{ ts_api_key }}"
+            status_code: [200, 204]
+          loop: "{{ users_to_delete }}"
+          when: users_to_delete | length > 0
+          loop_control:
+            label: "{{ item.loginName }} (id={{ item.id }})"
+
+        - name: 待删除但远端不存在时提示
+          ansible.builtin.debug:
+            msg: "{{ item }} 不在远端用户列表，跳过删除"
+          loop: "{{ ts_users_absent }}"
+          when: users_list | selectattr('loginName', 'equalto', item) | list | length == 0

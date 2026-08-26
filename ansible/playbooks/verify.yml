@@ -1,0 +1,41 @@
+---
+# 快速连通验证：tailscale version/status + 两节点互 ping
+# 用法: ansible-playbook playbooks/verify.yml -K
+
+- name: 收集两节点的 tailscale 状态
+  hosts: all
+  become: true
+  tasks:
+    - name: tailscale status
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: ts_status
+      changed_when: false
+      failed_when: false
+
+    - name: 本节点 tailscale IPv4
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} ip -4"
+      register: ts_ip
+      changed_when: false
+      failed_when: false
+
+    - name: 输出状态
+      ansible.builtin.debug:
+        msg: "{{ ts_status.stdout_lines }}"
+
+- name: 从 mac 向远端 ping（验证两机 mesh 连通）
+  hosts: local
+  become: false
+  tasks:
+    - name: ping 10.9.202.217 的 tailscale IP
+      ansible.builtin.command:
+        cmd: "ping -c 2 {{ hostvars['box-217'].ts_ip.stdout }}"
+      when: hostvars['box-217'].ts_ip.rc == 0
+      register: ping_result
+      changed_when: false
+      failed_when: false
+
+    - name: ping 结果
+      ansible.builtin.debug:
+        msg: "{{ ping_result.stdout_lines | default(['ping 失败，确认两端已 tailscale up']) }}"
