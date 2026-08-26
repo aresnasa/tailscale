@@ -36,6 +36,14 @@ ts_up_extra_args: ""
 #   ts_forward_proxy: "http://127.0.0.1:7890"      # Clash Verge HTTP
 ts_forward_proxy: "http://127.0.0.1:7890"
 
+# ---- tailscaled 自身访问控制面的代理（HTTP_PROXY/HTTPS_PROXY）----
+# TS_FORWARD_PROXY 只对 exit node 转发流量生效，不影响 tailscaled 连控制面
+# （controlplane.tailscale.com）。如果 Mac 本身无法直连控制面（如 GFW 拦截），
+# 需要单独设置此变量，让 tailscaled 的控制面连接也走代理。
+# 仅对 Mac（exit node）生效；Linux 客户端通常能直连控制面。
+# 留空则 tailscaled 直连控制面（默认行为）。
+ts_control_proxy: "http://127.0.0.1:7890"
+
 # ---- 连通验证测试 URL 列表（verify.yml）----
 # verify.yml 会从 217 经 Mac exit node 批量 curl 这些 URL。
 # 可通过 -e '{"test_urls":[...]}' 或 -e @file.yml 临时覆盖。

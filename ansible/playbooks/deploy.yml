@@ -202,26 +202,76 @@
       ansible.builtin.debug:
         msg: "{{ inventory_hostname }} [{{ ts_role | default('default') }}]: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}"
 
-- name: 可选：出口节点先 up（Mac 广播 exit node）
+- name: 出口节点 up（Mac 广播 exit node）
   hosts: local
   become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [up]
   tasks:
-    - name: tailscale up --advertise-exit-node（Mac）
+    # ---- 有 authkey：自动注册 ----
+    - name: tailscale up --advertise-exit-node（authkey 自动注册）
       ansible.builtin.command:
         cmd: "{{ ts_up_cmd }} --auth-key={{ ts_authkey }}"
       register: up_mac
       changed_when: true
       when: ts_authkey | length > 0
 
-- name: 可选：客户端 up 并指向 Mac 作为 exit node
+    # ---- 无 authkey：尝试 up，捕获登录 URL ----
+    # 用 timeout 15s 运行，超时后 tailscaled 会在后台继续等待认证
+    # 输出重定向到临时文件，避免 ansible 卡住
+    - name: tailscale up --advertise-exit-node（无 authkey，捕获登录 URL）
+      ansible.builtin.shell: |
+        timeout 15 {{ ts_up_cmd }} 2>&1 || true
+      register: up_mac_nologin
+      changed_when: false
+      failed_when: false
+      when: ts_authkey | length == 0
+
+    - name: 检查 Mac 是否已登录
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: mac_status
+      changed_when: false
+      failed_when: false
+      when: ts_authkey | length == 0
+
+    - name: 输出 Mac 登录指引
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  Mac-mini (exit node) 需要登录认证                            ║
+          ╠══════════════════════════════════════════════════════════════╣
+          {% if 'login.tailscale.com' in (up_mac_nologin.stdout | default('')) or 'login.tailscale.com' in (up_mac_nologin.stderr | default('')) %}
+          ║                                                              ║
+          ║  请在浏览器打开以下链接完成认证：                              ║
+          ║                                                              ║
+          ║  {{ (up_mac_nologin.stdout ~ up_mac_nologin.stderr) | regex_search('https://login\.tailscale\.com/[^ ]+') }} ║
+          ║                                                              ║
+          ║  授权后 Mac 会自动加入 tailnet 并广播 exit node。            ║
+          {% elif 'Logged out' in (mac_status.stdout | default('')) %}
+          ║                                                              ║
+          ║  Mac 尚未登录。请手动执行：                                    ║
+          ║  {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
+          ║                                                              ║
+          ║  或提供 authkey 自动注册：                                    ║
+          ║  ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
+          {% else %}
+          ║                                                              ║
+          ║  Mac 状态: {{ mac_status.stdout_lines | default(['未知']) }}
+          ║  up 输出: {{ up_mac_nologin.stdout_lines | default([]) }}
+          ║  up 错误: {{ up_mac_nologin.stderr_lines | default([]) }}
+          {% endif %}
+          ╚══════════════════════════════════════════════════════════════╝
+      when: ts_authkey | length == 0
+
+- name: 客户端 up 并指向 Mac 作为 exit node
   hosts: remote
   become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [up]
   tasks:
-    - name: tailscale up --exit-node（217）
+    # ---- 有 authkey：自动注册 ----
+    - name: tailscale up --exit-node（authkey 自动注册）
       ansible.builtin.command:
         cmd: "{{ ts_up_cmd }} --auth-key={{ ts_authkey }}"
       register: up_client
@@ -229,15 +279,76 @@
       failed_when: false
       when: ts_authkey | length > 0
 
-    - name: 若客户端 up 失败，提示去管理后台审批 Mac 的 exit node
+    # ---- 无 authkey：尝试 up，捕获登录 URL ----
+    - name: tailscale up --exit-node（无 authkey，捕获登录 URL）
+      ansible.builtin.shell: |
+        timeout 15 {{ ts_up_cmd }} 2>&1 || true
+      register: up_client_nologin
+      changed_when: false
+      failed_when: false
+      when: ts_authkey | length == 0
+
+    - name: 检查客户端是否已登录
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: client_status
+      changed_when: false
+      failed_when: false
+      when: ts_authkey | length == 0
+
+    - name: 输出客户端登录指引
       ansible.builtin.debug:
-        msg:
-          - "217 up 返回 rc={{ up_client.rc | default('skipped') }}"
-          - "{{ up_client.stdout_lines | default([]) }}"
-          - "{{ up_client.stderr_lines | default([]) }}"
-          - ">> 若提示 exit node 不可用：请到 Tailscale 管理后台 Machines → mac-mini → Edit route settings，"
-          - "   勾选 'Use as exit node' 并 Save（exit node 无 ACL 属性，必须后台一次性审批），随后重跑："
-          - "   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up"
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  {{ inventory_hostname }} (exit node client) 需要登录认证    ║
+          ╠══════════════════════════════════════════════════════════════╣
+          {% if 'login.tailscale.com' in (up_client_nologin.stdout | default('')) or 'login.tailscale.com' in (up_client_nologin.stderr | default('')) %}
+          ║                                                              ║
+          ║  请在浏览器打开以下链接完成认证：                              ║
+          ║                                                              ║
+          ║  {{ (up_client_nologin.stdout ~ up_client_nologin.stderr) | regex_search('https://login\.tailscale\.com/[^ ]+') }} ║
+          ║                                                              ║
+          ║  授权后客户端会自动加入 tailnet 并通过 Mac 出网。            ║
+          {% elif 'Logged out' in (client_status.stdout | default('')) %}
+          ║                                                              ║
+          ║  客户端尚未登录。请手动执行：                                  ║
+          ║  {{ ts_up_cmd | regex_replace('\\s+', ' ') }}
+          ║                                                              ║
+          ║  或提供 authkey 自动注册：                                    ║
+          ║  ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx --tags up
+          {% else %}
+          ║                                                              ║
+          ║  客户端状态: {{ client_status.stdout_lines | default(['未知']) }}
+          ║  up 输出: {{ up_client_nologin.stdout_lines | default([]) }}
+          ║  up 错误: {{ up_client_nologin.stderr_lines | default([]) }}
+          {% endif %}
+          ║                                                              ║
+          ║  ⚠ 若提示 exit node 不可用：                                 ║
+          ║    1. 确保 Mac 已认证并 up --advertise-exit-node              ║
+          ║    2. 到管理后台 Machines → Mac → Edit route settings        ║
+          ║       勾选 'Use as exit node' → Save                         ║
+          ║    3. 重跑: ansible-playbook playbooks/deploy.yml --tags up  ║
+          ╚══════════════════════════════════════════════════════════════╝
+      when: ts_authkey | length == 0
+
+    - name: 若客户端 up 失败（authkey 模式），提示去管理后台审批
+      ansible.builtin.debug:
+        msg: |
+          ╔══════════════════════════════════════════════════════════════╗
+          ║  {{ inventory_hostname }} up 失败 — exit node 未审批        ║
+          ╠══════════════════════════════════════════════════════════════╣
+          ║  rc={{ up_client.rc | default('?') }}                        ║
+          ║  输出: {{ up_client.stdout_lines | default([]) }}           ║
+          ║  错误: {{ up_client.stderr_lines | default([]) }}           ║
+          ║                                                              ║
+          ║  >> exit node 必须在管理后台一次性审批：                      ║
+          ║     https://login.tailscale.com/admin/machines               ║
+          ║     → 找到 Mac 节点 → ⋯ → Edit route settings                ║
+          ║     → 勾选 'Use as exit node' → Save                        ║
+          ║                                                              ║
+          ║  审批后重跑:                                                 ║
+          ║     ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up
+          ╚══════════════════════════════════════════════════════════════╝
       when: (ts_authkey | length > 0) and (up_client.rc | default(1) != 0)
 
 - name: 应用路由忽略配置（幂等；不重新 up 也能变更）
@@ -342,6 +453,10 @@
       changed_when: false
       failed_when: false # 未登录时 rc=1 属预期（Logged out.），不算失败
 
+    - name: 记录 tailscale status 结果（供总结使用）
+      ansible.builtin.set_fact:
+        ts_status: "{{ verify.results | selectattr('item', 'equalto', 'status') | first }}"
+
     - name: 输出验证结果
       ansible.builtin.debug:
         msg:
@@ -350,3 +465,46 @@
       loop: "{{ verify.results }}"
       loop_control:
         label: "{{ item.item }}"
+
+- name: 部署总结与下一步指引
+  hosts: localhost
+  gather_facts: false
+  tags: [up, verify]
+  tasks:
+    - name: 输出部署总结
+      ansible.builtin.debug:
+        msg: |
+          ╔════════════════════════════════════════════════════════════════════╗
+          ║                  Tailscale 部署完成 — 状态总结                      ║
+          ╠════════════════════════════════════════════════════════════════════╣
+          ║                                                                    ║
+          ║  节点状态:                                                         ║
+          ║    mac-mini  (exit node):        {{ '✓ 在线' if (hostvars['mac-mini'].ts_status.rc | default(1)) == 0 else '✗ 需登录' }}
+          ║    box-217    (exit node client): {{ '✓ 在线' if (hostvars['box-217'].ts_status.rc | default(1)) == 0 else '✗ 需登录' }}
+          ║                                                                    ║
+          ║  路由配置:                                                         ║
+          ║    ts_ignore_routes: {{ hostvars['box-217'].ts_ignore_routes | default([]) }}
+          ║    lan-access ip rule: {{ '✓ 5260 已安装' if hostvars['box-217'].lan_rules_apply is defined else '⚠ 待配置' }}
+          ║                                                                    ║
+          ╠════════════════════════════════════════════════════════════════════╣
+          ║                                                                    ║
+          ║  下一步操作:                                                       ║
+          ║                                                                    ║
+          ║  1. 若节点显示 '✗ 需登录':                                        ║
+          ║     • 浏览器打开上面输出的 login.tailscale.com 链接完成认证        ║
+          ║     • 或用 authkey 自动注册:                                       ║
+          ║       ./.venv/bin/ansible-playbook playbooks/deploy.yml \
+          ║         -e ts_authkey=tskey-auth-xxx --tags up                     ║
+          ║                                                                    ║
+          ║  2. 若 exit node 不可用（客户端 up 报错）:                        ║
+          ║     • 到管理后台审批 Mac 的 exit node:                              ║
+          ║       https://login.tailscale.com/admin/machines                   ║
+          ║       → Mac 节点 → ⋯ → Edit route settings                          ║
+          ║       → 勾选 'Use as exit node' → Save                             ║
+          ║     • 审批后重跑:                                                  ║
+          ║       ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up   ║
+          ║                                                                    ║
+          ║  3. 验证连通性:                                                   ║
+          ║     ./.venv/bin/ansible-playbook playbooks/verify.yml               ║
+          ║                                                                    ║
+          ╚════════════════════════════════════════════════════════════════════╝
