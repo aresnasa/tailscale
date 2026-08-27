@@ -136,7 +136,7 @@ TS_AUTHKEY=tskey-auth-xxx MAC_SUDO=xxx ./scripts/deploy-interactive.sh
 | `dns` | 3 | 仅在 `-e ts_dns_tcp_override=true` 时启用，默认不修改 DNS |
 | `verify` | 4 | 验证：tailscale status + 内网 ping + 外网 curl |
 
-> **DNS 默认行为**：不修改 217 原生 DNS（k8s 集群的 10.9.200.21 / 10.96.0.10）。部署后 tailscaled 通过 `--accept-dns=true` 默认加入 tailnet 的 100.100.100.100，未接管的查询依然走原本网卡 DNS。仅在明确需要 TCP 转发绕 GFW 时使用：
+> **DNS 默认行为**：不修改 217 原生 DNS（k8s 集群的 10.9.200.21 / 10.96.0.10）。部署后 tailscaled 通过 `--accept-dns=false` 保持不接管本地 DNS。仅在明确需要 TCP 转发绕 GFW 时使用：
 > ```sh
 > ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_dns_tcp_override=true --tags dns
 > ```
@@ -213,19 +213,10 @@ else
 fi
 
 # -------------------------------------------------------
-info "4. 检查 Mac TS_FORWARD_PROXY 环境变量"
+info "4. 检查 Mac exit node 转发路径（Clash TUN/增强模式）"
 # -------------------------------------------------------
-PID=$(pgrep -f 'tailscaled.*userspace' | head -1)
-if [ -n "$PID" ]; then
-    PROXY_ENV=$(ps -p "$PID" -wwwE 2>/dev/null | tr ' ' '\n' | grep "TS_FORWARD_PROXY" || echo "")
-    if [ -n "$PROXY_ENV" ]; then
-        pass "tailscaled 进程有 TS_FORWARD_PROXY: $PROXY_ENV"
-    else
-        fail "tailscaled 进程缺少 TS_FORWARD_PROXY"
-        echo "  重跑: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags install --limit local"
-        exit 1
-    fi
-fi
+echo "  exit node 的转发流量走系统默认出站路径。"
+echo "  请确认 Clash Verge 已开启 TUN/增强模式，否则被墙站点（GitHub/Google）会失败。"
 
 # -------------------------------------------------------
 info "5. 检查 217 tailscale 状态"
@@ -243,7 +234,7 @@ else
 fi
 
 # -------------------------------------------------------
-info "6. 检查 217 内网直连（ignore-routes + lan-access）"
+info "6. 检查 217 内网直连（lan-access）"
 # -------------------------------------------------------
 GW_PING=$(ssh "$REMOTE_HOST" 'ping -c 1 -W 2 10.9.202.1 2>&1' 2>/dev/null)
 if echo "$GW_PING" | grep -q "1 packets received"; then
@@ -262,14 +253,14 @@ else
 fi
 
 # -------------------------------------------------------
-info "7. 检查 217 ignore-routes 配置"
+info "7. 检查 217 内网绕过配置（lan-routes.conf）"
 # -------------------------------------------------------
-IGNORE_PREFS=$(ssh "$REMOTE_HOST" 'tailscale --socket=/var/run/tailscale/tailscaled.sock debug prefs 2>&1 | grep -A5 "IgnoreRoutes"' 2>/dev/null)
-if echo "$IGNORE_PREFS" | grep -q "10.0.0.0/8"; then
-    pass "217 IgnoreRoutes 包含 10.0.0.0/8"
+LAN_CONF=$(ssh "$REMOTE_HOST" 'cat /etc/tailscale/lan-routes.conf 2>/dev/null' 2>/dev/null)
+if echo "$LAN_CONF" | grep -q "10.0.0.0/8"; then
+    pass "217 lan-routes.conf 包含 10.0.0.0/8"
 else
-    fail "217 IgnoreRoutes 配置缺失"
-    echo "  修复: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,up"
+    fail "217 lan-routes.conf 缺失"
+    echo "  修复: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,lan"
 fi
 
 # -------------------------------------------------------
@@ -329,15 +320,15 @@ chmod +x verify-all.sh
 ✓ Mac 正在广播 exit node
 ▶ 3. 检查 Mac Clash 代理
 ✓ Clash Verge 代理正常 (7890)
-▶ 4. 检查 Mac TS_FORWARD_PROXY 环境变量
-✓ tailscaled 进程有 TS_FORWARD_PROXY: TS_FORWARD_PROXY=http://127.0.0.1:7890
+▶ 4. 检查 Mac exit node 转发路径（Clash TUN/增强模式）
+  exit node 的转发流量走系统默认出站路径。
 ▶ 5. 检查 217 tailscale 状态
 ✓ 217 在线 (100.73.82.118)，已使用 exit node
-▶ 6. 检查 217 内网直连（ignore-routes + lan-access）
+▶ 6. 检查 217 内网直连（lan-access）
 ✓ 217 内网网关 10.9.202.1 可达（直连）
 ✓ 217 ip rule 5260 已安装
-▶ 7. 检查 217 ignore-routes 配置
-✓ 217 IgnoreRoutes 包含 10.0.0.0/8
+▶ 7. 检查 217 内网绕过配置（lan-routes.conf）
+✓ 217 lan-routes.conf 包含 10.0.0.0/8
 ▶ 8. 测试 217 经 exit node 访问 GitHub
 ✓ 217 → GitHub: HTTP 200 (经 Mac exit node + Clash)
 ▶ 9. 测试 217 经 exit node 访问 Google
@@ -372,16 +363,15 @@ curl -sS -o /dev/null -w "%{http_code}" -x http://127.0.0.1:7890 https://github.
 
 **预期**：`200`。
 
-### 3. Mac TS_FORWARD_PROXY 进程环境
+### 3. Mac 控制面代理进程环境
 
 ```sh
 PID=$(pgrep -f 'tailscaled.*userspace' | head -1)
-ps -p "$PID" -wwwE | tr ' ' '\n' | grep -E "TS_FORWARD|HTTP_PROXY|HTTPS_PROXY"
+ps -p "$PID" -wwwE | tr ' ' '\n' | grep -E "HTTP_PROXY|HTTPS_PROXY"
 ```
 
 **预期**：
 ```
-TS_FORWARD_PROXY=http://127.0.0.1:7890
 HTTPS_PROXY=http://127.0.0.1:7890
 HTTP_PROXY=http://127.0.0.1:7890
 ```
@@ -428,19 +418,17 @@ throw 10.9.202.0/24
 throw 127.0.0.0/8
 ```
 
-### 8. 217 ignore-routes 配置
+### 8. 217 内网绕过配置（lan-routes.conf）
 
 ```sh
-ssh root@10.9.202.217 'tailscale --socket=/var/run/tailscale/tailscaled.sock debug prefs | grep -A5 IgnoreRoutes'
+ssh root@10.9.202.217 'cat /etc/tailscale/lan-routes.conf'
 ```
 
 **预期**：
 ```
-"IgnoreRoutes": [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16"
-],
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
 ```
 
 ### 9. 217 经 exit node 访问外网
@@ -474,7 +462,7 @@ ssh root@10.9.202.217 'curl -4 -sS -o /dev/null -w "%{http_code}" https://1.1.1.
 
 ### 问题：DNS 解析超时
 
-GFW 环境下 UDP 53 被 Wall，Mac 的 `TS_FORWARD_PROXY` 只代理 TCP。
+GFW 环境下 UDP 53 被 Wall，Mac 的 Clash TUN 模式也只代理 TCP。
 
 **临时绕过**：用 `--resolve` 指定 IP：
 ```sh
@@ -587,10 +575,9 @@ ansible/
 
 | 变量 | 作用 | 影响范围 |
 |---|---|---|
-| `ts_forward_proxy` | exit node 转发流量走 Clash（`TS_FORWARD_PROXY`） | 仅 Mac（`ts_platform=darwin`） |
 | `ts_control_proxy` | tailscaled 连控制面走 Clash（`HTTP_PROXY`/`HTTPS_PROXY`） | 仅 Mac（`ts_platform=darwin`） |
 
-> Linux 客户端不加这两个变量，避免连本地不存在的代理。
+> Linux 客户端不加这个变量，避免连本地不存在的代理。
 
 ### 路由优先级
 
@@ -600,12 +587,12 @@ force-tunnel(5050) < bypass(5100) < lan-access(5260) < Tailscale(5270)
 
 | 优先级 | 规则 | 作用 |
 |---|---|---|
-| 5050 | `to <IP> lookup 52` | 强制走隧道（覆盖 bypass 和 ignore-routes） |
+| 5050 | `to <IP> lookup 52` | 强制走隧道（覆盖 bypass 和 lan-access） |
 | 5100 | `to <IP> lookup main` | 直连白名单（绕过 exit node） |
-| 5260 | `to <CIDR> lookup main` | 内网双向可达（绕过 table 52 的 throw） |
+| 5260 | `to <CIDR> lookup main` | 内网双向可达（绕过 table 52） |
 | 5270 | `from all lookup 52` | Tailscale 默认（exit node 路由） |
 
-### IgnoreRoutes（RFC1918 三大段）
+### 内网网段（RFC1918 三大段）
 
 | 网段 | 覆盖场景 |
 |---|---|
@@ -615,6 +602,6 @@ force-tunnel(5050) < bypass(5100) < lan-access(5260) < Tailscale(5270)
 
 ### 已知限制
 
-- **DNS 污染**：GFW 环境下 UDP 53 被 Wall，`TS_FORWARD_PROXY` 只代理 TCP。验证时用 `--resolve` 绕过。生产环境需配 DoH/TCP DNS。
+- **DNS 污染**：GFW 环境下 UDP 53 被 Wall。验证时用 `--resolve` 绕过。生产环境需配 DoH/TCP DNS。
 - **ICMP 不转发**：Mac `userspace-networking` 模式不支持 ICMP 转发，Mac ping 217 会超时，属正常现象。
 - **exit node 需审批**：Mac `up --advertise-exit-node` 后需在管理后台一次性批准。
