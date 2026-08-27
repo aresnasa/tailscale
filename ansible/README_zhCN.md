@@ -132,8 +132,13 @@ TS_AUTHKEY=tskey-auth-xxx MAC_SUDO=xxx ./scripts/deploy-interactive.sh
 | `up` | 3 | tailscale up（Mac 广播 exit node，客户端指向 Mac） |
 | `discover` | 3.5 | 查询 tailnet IP + 回填 `ts_exit_node` + 重算 up 命令 （`ts_interactive=true` 时会先暂停等确认） |
 | `lan` | 3 | 配置 ip rule 5260 绕过 table 52（内网双向可达） |
-| `dns` | 3 | 配置 dnsmasq TCP 转发绕 GFW UDP 封锁 |
+| `dns` | 3 | 仅在 `-e ts_dns_tcp_override=true` 时启用，默认不修改 DNS |
 | `verify` | 4 | 验证：tailscale status + 内网 ping + 外网 curl |
+
+> **DNS 默认行为**：不修改 217 原生 DNS（k8s 集群的 10.9.200.21 / 10.96.0.10）。部署后 tailscaled 通过 `--accept-dns=true` 默认加入 tailnet 的 100.100.100.100，未接管的查询依然走原本网卡 DNS。仅在明确需要 TCP 转发绕 GFW 时使用：
+> ```sh
+> ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_dns_tcp_override=true --tags dns
+> ```
 
 ---
 

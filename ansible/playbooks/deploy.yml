@@ -507,13 +507,13 @@
         - ts_authkey | length == 0
         - "'Logged out' in (client_status.stdout | default(''))"
 
-    # ---- 已登录：用 --reset 重置所有非默认参数，避免重列漏报告错 ----
-    # tailscale 对「省略了之前已设置过的隐式参数」会拒志。
-    # --reset 等价于先 reset 再应用本次 cmd，保证了幂等。
-    # 与之前重列式 compose 重复列出 --ignore-routes 同样效果。
-    - name: tailscale up --reset（已登录，幂等重置所有隐式参数）
+    # ---- 已登录：不使用 --reset，确保多次 up 是幂等不丢登录状态 ----
+    # 第一版加了 --reset 会在 authkey 过期后强制再 login，丢失状态。
+    # 当前版本改为：明确重列所有隐式参数，tailscale 要所有参数都提及才幂等。
+    # tailscale 会拒志'changing settings via'错误 -- 这里全面补齐。
+    - name: tailscale up（已登录，明确重列所有隐式参数保持幂等）
       ansible.builtin.shell: |
-        {{ ts_up_cmd }} --reset 2>&1 || true
+        {{ ts_up_cmd }} 2>&1 || true
       register: up_client_loggedin
       changed_when: true
       failed_when: false
@@ -593,13 +593,22 @@
       changed_when: set_ignore.rc | default(1) == 0
       failed_when: false
 
+    - name: tailscale set --accept-dns（用默认 DNS 模式，幂等）
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} set --accept-dns=true"
+      register: set_dns
+      changed_when: set_dns.rc | default(1) == 0
+      failed_when: false
+
     - name: 若 set 失败给出提示
       ansible.builtin.debug:
         msg:
-          - "{{ inventory_hostname }}: set --ignore-routes rc={{ set_ignore.rc | default('skipped') }}"
-          - "{{ set_ignore.stderr_lines | default([]) }}"
+          - "{{ inventory_hostname }}:"
+          - "  set --ignore-routes rc={{ set_ignore.rc | default('skipped') }}"
+          - "  set --accept-dns rc={{ set_dns.rc | default('skipped') }}"
+          - "{{ set_ignore.stderr_lines | default(set_dns.stderr_lines | default([])) }}"
           - ">> 若 daemon 未部署/未登录，先跑 --tags install 或带 ts_authkey 的 up。"
-      when: (set_ignore.rc | default(0)) != 0
+      when: (set_ignore.rc | default(0)) != 0 or (set_dns.rc | default(0)) != 0
 
 - name: 配置内网绕过 table 52（ip rule 5260）
   # --ignore-routes 只处理出方向，入方向回包仍命中 table 52 的 throw/default。
@@ -661,39 +670,55 @@
           - "{{ lan_rules_apply.stdout_lines | default([]) }}"
 
 # ═══════════════════════════════════════════════════════════════
-# 阶段 3e: 配置 TCP DNS 转发（绕过 GFW UDP 53 封锁）
+# 阶段 3e: 只在明确开启时才写 TCP DNS 转发
+# 预设关闭：217 原生 systemd-resolved 管理 k8s cluster DNS (10.9.200.21, 10.96.0.10)
+# 替换 resolv.conf 会中断 cluster DNS，需要用户自己管理
+# 明清楚需要 GFW 绕行时启用 -e ts_dns_tcp_override=true
 # ═══════════════════════════════════════════════════════════════
-- name: 配置 TCP DNS 转发（绕过 GFW UDP 53 封锁）
-  # 问题：217 的 DNS 查询经 MagicDNS 到 Mac tailscaled → SERVFAIL（无上游 resolver）
-  # 解法：本地 dnsmasq 用 TCP 转发到 8.8.8.8（经 exit node 隧道）
+- name: 可选 TCP DNS 转发（只在 ts_dns_tcp_override=true 时启用）
   hosts: remote
   become: true
   gather_facts: false
-  tags: [up, dns]
+  tags: [dns]
   tasks:
+    - name: 提示默认不修改 DNS
+      ansible.builtin.debug:
+        msg: |
+          ▶ {{ inventory_hostname }} 原生 DNS 保留（未开启 ts_dns_tcp_override）
+            rebound DNS: {{ hostvars[inventory_hostname].ts_ignore_routes | default([]) }}
+            如需用 TCP 转发到 8.8.8.8 绕 GFW:
+              -e ts_dns_tcp_override=true ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags dns
+      when: not (ts_dns_tcp_override | default(false) | bool)
+
     - name: 确保 dnsmasq 已安装
       ansible.builtin.apt:
         name: dnsmasq
         state: present
         update_cache: true
+      when: ts_dns_tcp_override | default(false) | bool
 
     - name: 安装 TCP DNS 配置脚本
       ansible.builtin.template:
         src: setup-dns-tcp.sh.j2
         dest: /usr/local/sbin/setup-dns-tcp.sh
         mode: "0755"
+      when: ts_dns_tcp_override | default(false) | bool
 
     - name: 执行 DNS 配置
       ansible.builtin.command:
         cmd: /usr/local/sbin/setup-dns-tcp.sh up
       register: dns_setup
       changed_when: "'已启动' in dns_setup.stdout"
+      when: ts_dns_tcp_override | default(false) | bool
 
     - name: 输出 DNS 配置结果
       ansible.builtin.debug:
         msg:
           - "===== {{ inventory_hostname }} TCP DNS 配置 ====="
           - "{{ dns_setup.stdout_lines }}"
+      when:
+        - ts_dns_tcp_override | default(false) | bool
+        - dns_setup is defined
 
 # ═══════════════════════════════════════════════════════════════
 # 阶段 4: 验证连通性
