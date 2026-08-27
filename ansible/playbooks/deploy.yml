@@ -380,14 +380,55 @@
   gather_facts: false
   tags: [discover]
   tasks:
-    - name: 解析 ts_exit_node → IP（若其引用 inventory 中的主机名）
+    # 期望的 exit node IP —— 两种场景：
+    #   1. ts_exit_node 是主机名引用（如 'mac-mini'） → 取该主机的 ts_tailnet_ip（可能是旧或新）
+    #   2. ts_exit_node 是具体 IP —— 通过检索 100.64.0.0/10 范围内任意 exit-node 主机名
+    #      到本机的 tailnet IP 不一致，认为跨 tailnet 应覆盖
+    - name: 计算期望的 exit node IP
       ansible.builtin.set_fact:
-        ts_exit_node: "{{ hostvars[ts_exit_node].ts_tailnet_ip }}"
+        ts_exit_node_is_hostname_ref: "{{ ts_exit_node in (groups['all'] | default([])) }}"
+        ts_expected_exit_node_ip: >-
+          {% if ts_exit_node in (groups['all'] | default([])) -%}
+            {{ hostvars[ts_exit_node].ts_tailnet_ip | default('') }}
+          {%- else -%}
+            {%- set ns = namespace(correct='') -%}
+            {%- for h in groups['all'] | default([]) -%}
+              {%- if hostvars[h].ts_role | default('') == 'exit-node'
+                      and hostvars[h].ts_tailnet_ip | default('') | length > 0 -%}
+                {%- set ns.correct = hostvars[h].ts_tailnet_ip -%}
+              {%- endif -%}
+            {%- endfor -%}
+            {{ ns.correct if (ns.correct | length > 0) else ts_exit_node }}
+          {%- endif %}
+      when: ts_role | default('') == 'exit-node-client'
+
+    - name: 判断 IP 是否正确（考虑只有一台 exit node 以及跨 tailnet 场景）
+      ansible.builtin.set_fact:
+        ts_exit_node_should_be_synced: >-
+          {{ ts_exit_node_is_hostname_ref | bool or
+             ( ts_expected_exit_node_ip | length > 0 and
+               ts_exit_node != ts_expected_exit_node_ip ) }}
+      when:
+        - ts_role | default('') == 'exit-node-client'
+        - ts_expected_exit_node_ip | default('') | length > 0
+
+    - name: 解析 ts_exit_node → 期望 IP（跨 tailnet 或 主机名 都会覆盖）
+      ansible.builtin.set_fact:
+        ts_exit_node: "{{ ts_expected_exit_node_ip }}"
         ts_exit_node_resolved: true
       when:
         - ts_role | default('') == 'exit-node-client'
-        - ts_exit_node in (groups['all'] | default([]))
-        - hostvars[ts_exit_node].ts_tailnet_ip | default('') | length > 0
+        - ts_exit_node_should_be_synced | bool | default(false)
+
+    - name: IP 已一致（不需变更）时提示
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: ts_exit_node={{ ts_exit_node }} 已是最新 100.x IP，无需变更"
+      when:
+        - ts_role | default('') == 'exit-node-client'
+        - not ts_exit_node_is_hostname_ref | bool
+        - not (ts_exit_node_resolved | default(false))
+        - ts_expected_exit_node_ip | default('') | length > 0
+        - ts_exit_node == ts_expected_exit_node_ip
 
     - name: 无法解析时提示（保持原值）
       ansible.builtin.debug:
@@ -466,10 +507,13 @@
         - ts_authkey | length == 0
         - "'Logged out' in (client_status.stdout | default(''))"
 
-    # ---- 已登录：直接执行 up 更新配置（exit-node/ignore-routes 等）----
-    - name: tailscale up（已登录，更新 exit-node 配置）
-      ansible.builtin.command:
-        cmd: "{{ ts_up_cmd }}"
+    # ---- 已登录：用 --reset 重置所有非默认参数，避免重列漏报告错 ----
+    # tailscale 对「省略了之前已设置过的隐式参数」会拒志。
+    # --reset 等价于先 reset 再应用本次 cmd，保证了幂等。
+    # 与之前重列式 compose 重复列出 --ignore-routes 同样效果。
+    - name: tailscale up --reset（已登录，幂等重置所有隐式参数）
+      ansible.builtin.shell: |
+        {{ ts_up_cmd }} --reset 2>&1 || true
       register: up_client_loggedin
       changed_when: true
       failed_when: false
@@ -504,28 +548,33 @@
         - ts_authkey | length == 0
         - "'Logged out' in (client_status.stdout | default(''))"
 
-    - name: 若客户端 up 失败（已登录模式），提示去管理后台审批
-      ansible.builtin.debug:
-        msg: |
-          ╔══════════════════════════════════════════════════════════════╗
-          ║  {{ inventory_hostname }} up 失败 — exit node 未审批或不可用 ║
-          ╠══════════════════════════════════════════════════════════════╣
-          ║  rc={{ up_client_loggedin.rc | default('?') }}
-          ║  输出: {{ up_client_loggedin.stdout_lines | default([]) }}
-          ║  错误: {{ up_client_loggedin.stderr_lines | default([]) }}
-          ║                                                              ║
-          ║  >> exit node 必须在管理后台一次性审批：                      ║
-          ║     https://login.tailscale.com/admin/machines               ║
-          ║     → 找到 Mac 节点 → ⋯ → Edit route settings                ║
-          ║     → 勾选 'Use as exit node' → Save                        ║
-          ║                                                              ║
-          ║  审批后重跑:                                                 ║
-          ║     ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags up
-          ╚══════════════════════════════════════════════════════════════╝
+    # ---- 为出 troubleshooting：up 成功 / 失败 详细记录，避免上预 debug 模棱 ----
+    - name: tailscale status
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} status"
+      register: up_client_post_status
+      changed_when: false
+      failed_when: false
       when:
         - ts_authkey | length == 0
         - "'Logged out' not in (client_status.stdout | default(''))"
-        - (up_client_loggedin.rc | default(1)) != 0
+
+    - name: 输出 up 结果与提示
+      ansible.builtin.debug:
+        msg:
+          - "===== {{ inventory_hostname }} up --reset 结果 ====="
+          - "rc={{ up_client_loggedin.rc | default('?') }}"
+          - "{{ up_client_loggedin.stdout_lines | default([]) }}"
+          - "{{ up_client_loggedin.stderr_lines | default([]) }}"
+          - "tailnet IP: {{ hostvars[inventory_hostname].ts_tailnet_ip | default('(未知)') }}"
+          - "当前 exit node: {{ ts_exit_node }}"
+          - ""
+          - "若 up --reset 依然报错：可能网络抖动或管理后台尚未批准 exit node"
+          - "   管理后台: https://login.tailscale.com/admin/machines"
+          - "   → 找到 Mac 节点 → ⋯ → Edit route settings → 勾选 'Use as exit node' → Save"
+      when:
+        - ts_authkey | length == 0
+        - "'Logged out' not in (client_status.stdout | default(''))"
 
 # ═══════════════════════════════════════════════════════════════
 # 阶段 3d: 应用路由忽略配置 + 内网绕过 table 52

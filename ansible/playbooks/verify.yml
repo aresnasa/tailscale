@@ -172,7 +172,14 @@
               tailnet IP           = {{ box.ts_ip.stdout | default('(未获取)') }}
 
           Mesh 探测 (Mac → 217 tailscale ping):
-            {{ '✓ 成功' if (mac.ping_result.rc | default(1)) == 0 else '✗ 失败/未运行' }}
+            {% set pong_received = 'pong from' in (mac.ping_result.stdout | default('')) %}
+            {% if pong_received %}
+            ✓ 成功（pong from 已收到；可能走 DERP 而非 direct，已由 pong 确认连通）
+            {% elif (mac.ping_result.rc | default(1)) == 0 %}
+            ✓ 成功
+            {% else %}
+            ✗ 失败/未运行
+            {% endif %}
 
           内网 (217 → 物理网关 ping):
             {{ '✓ 成功' if (box.gw_ping.rc | default(1)) == 0 else '✗ 失败/未运行' }}
@@ -186,5 +193,6 @@
           失败排查:
             Mac tailnet IP 为空 → Mac 未登录，重跑 deploy.yml --tags up
             tailscale ping 失败 → 两机未 join 同 tailnet 或被 ACL 拦截
+            mesh 走 DERP 而非 direct → 不是错误，多数跨地域场景都走 DERP 中转
             外网全失败 → 管理后台未审批 exit node，或未配 ts_forward_proxy
           ══════════════════════════════════════════════════════════

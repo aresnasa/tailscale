@@ -83,11 +83,13 @@ cd ansible
 
 ```sh
 ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags verify
-# 或用专门的验证 playbook（末尾汇总结论，Mac→217 走 tailscale ping）
+# 或用专门的验证 playbook（末尾汇总结论，Mac→217 走 tailscale ping，只要 stdout 有 pong 即为通）
 ./.venv/bin/ansible-playbook playbooks/verify.yml
 # 或交互脚本（可选输入 Mac sudo / 自定义 TEST_URLS）
 ./scripts/verify-interactive.sh
 ```
+
+> **说明**：`tailscale ping` 若走 DERP 中转（绝大多数跨地域场景）会在最后一行提示 `direct connection not established` 并设 rc=1，但任何一句 `pong from xxx` 返回即代表连通。verify.yml 会以 stdout 包含 `pong from` 为连通标准。
 
 ### 全量一键（带 authkey）
 
