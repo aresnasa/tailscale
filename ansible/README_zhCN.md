@@ -83,14 +83,39 @@ cd ansible
 
 ```sh
 ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags verify
-# 或用专门的验证 playbook
+# 或用专门的验证 playbook（末尾汇总结论，Mac→217 走 tailscale ping）
 ./.venv/bin/ansible-playbook playbooks/verify.yml
+# 或交互脚本（可选输入 Mac sudo / 自定义 TEST_URLS）
+./scripts/verify-interactive.sh
 ```
 
 ### 全量一键（带 authkey）
 
 ```sh
 ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxxxxxxx
+```
+
+### 两阶段交互部署（推荐：自动回填 Mac tailnet IP）
+
+推荐用 `scripts/deploy-interactive.sh` 驱动全流程，脚本会依次：
+
+1. 提示输入 **`ts_authkey`**（读自 `TS_AUTHKEY` 环境变量优先）
+2. 提示输入本机 **Mac sudo 密码**（读自 `MAC_SUDO` 环境变量优先，校验后透传 ansible_become_password）
+3. **Phase 1**: `--tags build,install,detect,up` —— 构建 + 分发 + Mac 用 authkey 自动注册并起 up `--advertise-exit-node`
+4. 提示你在管理后台 [批准 mac-mini 为 exit node](https://login.tailscale.com/admin/machines)
+5. **Phase 2**: `--tags discover,up,lan,dns,verify` —— 查询 `tailscale ip -4` 得到 Mac 实际 tailnet IP，自动回填 `inventory/hosts.ini` 里客户端的 `ts_exit_node=`，重跑客户端 up/lan/dns 并验证
+
+```sh
+# 什么都不输入，逐项提示
+./scripts/deploy-interactive.sh
+
+# 或预先提供
+TS_AUTHKEY=tskey-auth-xxx MAC_SUDO=xxx ./scripts/deploy-interactive.sh
+```
+
+也可只手动走一次 discover（比如换 Mac 后重同步 IP）：
+```sh
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags discover
 ```
 
 ---
@@ -103,7 +128,9 @@ cd ansible
 | `install` | 1b | 分发二进制 + 生成配置 + 启动 daemon |
 | `detect` | 2 | 检测 RFC1918 三大私有网段 → 填充 `ts_ignore_routes` |
 | `up` | 3 | tailscale up（Mac 广播 exit node，客户端指向 Mac） |
+| `discover` | 3.5 | 查询 tailnet IP + 回填 `ts_exit_node` + 重算 up 命令 （`ts_interactive=true` 时会先暂停等确认） |
 | `lan` | 3 | 配置 ip rule 5260 绕过 table 52（内网双向可达） |
+| `dns` | 3 | 配置 dnsmasq TCP 转发绕 GFW UDP 封锁 |
 | `verify` | 4 | 验证：tailscale status + 内网 ping + 外网 curl |
 
 ---

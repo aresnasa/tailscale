@@ -30,21 +30,23 @@
           - "===== {{ inventory_hostname }} status ====="
           - "{{ ts_status.stdout_lines }}"
 
-- name: 从 mac 向远端 ping（验证两机 mesh 连通）
+- name: 从 mac 向远端 probe（验证两机 mesh 连通）
   hosts: local
   become: false
   tasks:
-    - name: ping 10.9.202.217 的 tailscale IP
+    # Mac 是 userspace-networking 模式（无 tailscale0 网卡），系统 ping 打不进 tailnet
+    # 必须走 tailscaled 自身的 tailscale ping（disco/TSMP 探测，用户态下也可用）
+    - name: tailscale ping 10.9.202.217 的 tailscale IP
       ansible.builtin.command:
-        cmd: "ping -c 2 {{ hostvars['box-217'].ts_ip.stdout }}"
-      when: hostvars['box-217'].ts_ip.rc == 0
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} ping -c 2 --timeout 8s {{ hostvars['box-217'].ts_ip.stdout }}"
+      when: (hostvars['box-217'].ts_ip.rc | default(1)) == 0
       register: ping_result
       changed_when: false
       failed_when: false
 
-    - name: ping 结果
+    - name: probe 结果
       ansible.builtin.debug:
-        msg: "{{ ping_result.stdout_lines | default(['ping 失败，确认两端已 tailscale up']) }}"
+        msg: "{{ ping_result.stdout_lines | default(ping_result.stderr_lines | default(['tailscale ping 失败，确认两端已 tailscale up'])) }}"
 
 - name: 验证 217 经 Mac 出口节点批量访问测试 URL
   hosts: remote
@@ -145,3 +147,44 @@
           - "  2. 确认 ts_ignore_routes 包含本机网段"
           - "  3. 检查 tailscale-lan-rules.service: systemctl status tailscale-lan-rules"
           - "  4. 手动应用: /usr/local/sbin/tailscale-lan-rules.sh up"
+
+# ═══════════════════════════════════════════════════════════════
+# 验证总结（汇总上述所有 probe 结果）
+# ═══════════════════════════════════════════════════════════════
+- name: 验证总结
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: 汇总两节点连通状态
+      ansible.builtin.debug:
+        msg: |
+          ══════════════════════════════════════════════════════════
+                      Tailscale 验证总结
+          ══════════════════════════════════════════════════════════
+          {% set mac = hostvars['mac-mini'] | default({}) %}
+          {% set box = hostvars['box-217'] | default({}) %}
+          节点状态:
+            mac-mini:
+              tailscale status rc = {{ mac.ts_status.rc | default('?') }}
+              tailnet IP           = {{ mac.ts_ip.stdout | default('(未获取)') }}
+            box-217:
+              tailscale status rc = {{ box.ts_status.rc | default('?') }}
+              tailnet IP           = {{ box.ts_ip.stdout | default('(未获取)') }}
+
+          Mesh 探测 (Mac → 217 tailscale ping):
+            {{ '✓ 成功' if (mac.ping_result.rc | default(1)) == 0 else '✗ 失败/未运行' }}
+
+          内网 (217 → 物理网关 ping):
+            {{ '✓ 成功' if (box.gw_ping.rc | default(1)) == 0 else '✗ 失败/未运行' }}
+
+          外网 (217 经 Mac exit node curl):
+            {% set results = box.curl_results.results | default([]) %}
+            {% set ok = results | selectattr('rc', 'equalto', 0) | list %}
+            {{ ok | length }}/{{ results | length }} 成功
+
+          ────────────────────────────────────────────────────────
+          失败排查:
+            Mac tailnet IP 为空 → Mac 未登录，重跑 deploy.yml --tags up
+            tailscale ping 失败 → 两机未 join 同 tailnet 或被 ACL 拦截
+            外网全失败 → 管理后台未审批 exit node，或未配 ts_forward_proxy
+          ══════════════════════════════════════════════════════════

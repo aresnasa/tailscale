@@ -22,6 +22,10 @@ ts_dist_dir: "{{ playbook_dir }}/../../dist"
 #   ansible-playbook playbooks/deploy.yml -K -e ts_authkey=tskey-auth-xxx
 ts_authkey: ""
 
+# 交互模式：true 时在 discover 阶段前暂停，等待人工确认（适合两阶段部署）。
+# scripts/deploy-interactive.sh 会自动置为 true；手动跑时可用 -e ts_interactive=true 开启。
+ts_interactive: false
+
 # 追加给 tailscale up 的额外参数（如 --advertise-exit-node 之外的需求）
 ts_up_extra_args: ""
 

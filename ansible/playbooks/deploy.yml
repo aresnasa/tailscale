@@ -25,7 +25,21 @@
 #   # 全量一键（带 authkey 自动注册）
 #   ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=tskey-auth-xxx
 #
+#   # 两阶段交互式（推荐：自动回填 Mac tailnet IP）
+#   TS_AUTHKEY=tskey-auth-xxx MAC_SUDO=xxx ./scripts/deploy-interactive.sh
+#   ./scripts/deploy-interactive.sh        # 逐项提示输入 authkey + Mac sudo
+#
+#   # 手动补一轮 IP 回填（换 Mac 或 IP 漂移后重同步）
+#   ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags discover
+#
 # 共用变量位于 playbooks/group_vars/all.yml（Ansible 自动加载 playbook 同级 group_vars）
+#
+# discover 阶段（任3.5）：
+#   1. tailscale ip -4 → 写入各处 ts_tailnet_ip fact
+#   2. 对 exit-node-client：解析 ts_exit_node（主机名或对端 inventory 名）→ tailnet IP
+#   3. 用 replace 模块回填 inventory/hosts.ini 中该客户端 ts_exit_node= 值
+#   4. 重算该客户端 ts_up_cmd，后续 up 使用新值
+#   discover 能优雅降级：未登录/未上报 IP 时保持原 ts_exit_node 不变。
 
 # ═══════════════════════════════════════════════════════════════
 # 阶段 1a: 构建二进制（仅本机交叉编译）
@@ -311,6 +325,108 @@
       when:
         - ts_authkey | length == 0
         - "'Logged out' in (mac_status.stdout | default(''))"
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3.5a: （可选交互）阶段间确认 — 需 -e ts_interactive=true
+# ═══════════════════════════════════════════════════════════════
+- name: 阶段间交互确认（exit node 审批提示）
+  hosts: localhost
+  gather_facts: false
+  tags: [discover]
+  tasks:
+    - name: 等待人工确认
+      ansible.builtin.pause:
+        prompt: |
+          ════════════════ 阶段确认：exit node 审批 ════════════════
+          Mac 已完成 tailscale up（--advertise-exit-node）。
+          继续前请确认已在管理后台批准 Mac 作为 exit node：
+            https://login.tailscale.com/admin/machines
+            → mac-mini → ⋯ → Edit route settings → 'Use as exit node' → Save
+          按回车继续；Ctrl+C 中止。
+      when: ts_interactive | bool | default(false)
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3.5b: 收集各节点 tailnet IPv4（写入 ts_tailnet_ip fact）
+# ═══════════════════════════════════════════════════════════════
+- name: 查询各节点 tailnet 内部 IP（tailscale ip -4）
+  hosts: all
+  become: "{{ ts_become | bool }}"
+  gather_facts: false
+  tags: [discover]
+  tasks:
+    - name: tailscale ip -4
+      ansible.builtin.command:
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} ip -4"
+      register: ts_self_ip
+      changed_when: false
+      failed_when: false
+
+    - name: 写入 ts_tailnet_ip fact
+      ansible.builtin.set_fact:
+        ts_tailnet_ip: "{{ ts_self_ip.stdout_lines | first | default('') | trim }}"
+      when:
+        - (ts_self_ip.rc | default(1)) == 0
+        - ts_self_ip.stdout_lines | default([]) | length > 0
+
+    - name: 输出节点 tailnet IP（本阶段的登录结果展示）
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} [{{ ts_role | default('default') }}] tailnet IP: {{ ts_tailnet_ip | default('(未登录，暂不可用)') }}"
+
+# ═══════════════════════════════════════════════════════════════
+# 阶段 3.5c: 解析 client 的 ts_exit_node、回填 inventory 并重算 up 命令
+# ═══════════════════════════════════════════════════════════════
+- name: 解析 exit-node-client 的 ts_exit_node 为实际 tailnet IP 并回填 inventory
+  hosts: remote
+  gather_facts: false
+  tags: [discover]
+  tasks:
+    - name: 解析 ts_exit_node → IP（若其引用 inventory 中的主机名）
+      ansible.builtin.set_fact:
+        ts_exit_node: "{{ hostvars[ts_exit_node].ts_tailnet_ip }}"
+        ts_exit_node_resolved: true
+      when:
+        - ts_role | default('') == 'exit-node-client'
+        - ts_exit_node in (groups['all'] | default([]))
+        - hostvars[ts_exit_node].ts_tailnet_ip | default('') | length > 0
+
+    - name: 无法解析时提示（保持原值）
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: ts_exit_node={{ ts_exit_node }} 未变更"
+          - "原因：已是具体 IP，或对端主机未上报 ts_tailnet_ip（尚未完成 up）"
+      when:
+        - ts_role | default('') == 'exit-node-client'
+        - not (ts_exit_node_resolved | default(false))
+
+    - name: 回填 ts_exit_node IP 到 inventory/hosts.ini
+      ansible.builtin.replace:
+        path: "{{ playbook_dir }}/../inventory/hosts.ini"
+        regexp: "^(\\s*{{ inventory_hostname }}\\s+.*?)ts_exit_node=\\S+"
+        replace: "\\1ts_exit_node={{ ts_exit_node }}"
+      delegate_to: localhost
+      register: hosts_ini_backfill
+      when: ts_exit_node_resolved | default(false)
+
+    - name: 重算客户端 up 命令（使用解析后的 ts_exit_node）
+      ansible.builtin.set_fact:
+        ts_up_cmd: >-
+          {{ ts_install_dir }}/tailscale --socket={{ ts_socket }} up
+          --hostname={{ inventory_hostname }}
+          {% if ts_role == 'exit-node' %}--advertise-exit-node
+          {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes --exit-node-allow-lan-access
+          {% endif %}
+          {% if ts_ignore_routes | default([]) | length > 0 %}--ignore-routes={{ ts_ignore_routes | join(',') }}
+          {% endif %}
+          {{ ts_up_extra_args }}
+      when: ts_exit_node_resolved | default(false)
+
+    - name: 输出回填结果
+      ansible.builtin.debug:
+        msg:
+          - "{{ inventory_hostname }}: ts_exit_node → {{ ts_exit_node }}"
+          - "hosts.ini {{ '已更新' if hosts_ini_backfill.changed | default(false) else '无变化（已是该值）' }}"
+          - "up 命令: {{ ts_up_cmd | regex_replace('\\s+', ' ') }}"
+      when: ts_exit_node_resolved | default(false)
 
 # ═══════════════════════════════════════════════════════════════
 # 阶段 3c: 客户端 up 并指向 Mac 作为 exit node
