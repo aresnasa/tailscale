@@ -129,25 +129,6 @@ type Prefs struct {
 	// routed directly or via the exit node.
 	ExitNodeAllowLANAccess bool
 
-	// IgnoreRoutes specifies CIDR prefixes that must never be routed
-	// through Tailscale. Traffic to these prefixes always uses the
-	// system's own routing (typically the physical network's default
-	// gateway), even when an exit node is selected or a peer
-	// advertises a covering subnet route.
-	//
-	// An advertised subnet route fully covered by an entry here is
-	// excluded from the tunnel entirely. For the exit node's default
-	// routes, the complement of these prefixes is installed instead
-	// of the default route itself, so only the non-ignored remainder
-	// of the internet is carried by the exit node. Partially covered
-	// subnet routes (an entry smaller than the advertised route) are
-	// not split; the route is installed as-is.
-	//
-	// Peers' own Tailscale addresses (100.64.0.0/10 and the ULA
-	// range) are never affected, so the tailnet itself keeps working
-	// regardless of what is listed here.
-	IgnoreRoutes []netip.Prefix
-
 	// CorpDNS specifies whether to install the Tailscale network's
 	// DNS configuration, if it exists. It is the internal name for
 	// the "tailscale set --accept-dns=" flag.
@@ -382,7 +363,6 @@ type MaskedPrefs struct {
 	AutoExitNodeSet               bool                `json:",omitempty"`
 	InternalExitNodePriorSet      bool                `json:",omitempty"` // Internal; can't be set by LocalAPI clients
 	ExitNodeAllowLANAccessSet     bool                `json:",omitempty"`
-	IgnoreRoutesSet               bool                `json:",omitempty"`
 	CorpDNSSet                    bool                `json:",omitempty"`
 	RunSSHSet                     bool                `json:",omitempty"`
 	RunWebClientSet               bool                `json:",omitempty"`
@@ -694,7 +674,6 @@ func (p *Prefs) Equals(p2 *Prefs) bool {
 		p.AutoExitNode == p2.AutoExitNode &&
 		p.InternalExitNodePrior == p2.InternalExitNodePrior &&
 		p.ExitNodeAllowLANAccess == p2.ExitNodeAllowLANAccess &&
-		slices.Equal(p.IgnoreRoutes, p2.IgnoreRoutes) &&
 		p.CorpDNS == p2.CorpDNS &&
 		p.RunSSH == p2.RunSSH &&
 		p.Sync.Normalized() == p2.Sync.Normalized() &&

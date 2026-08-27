@@ -1160,7 +1160,6 @@ func TestUpdatePrefs(t *testing.T) {
 				ExitNodeIDSet:             true,
 				ExitNodeIPSet:             true,
 				HostnameSet:               true,
-				IgnoreRoutesSet:           true,
 				NetfilterModeSet:          true,
 				NoSNATSet:                 true,
 				NoStatefulFilteringSet:    true,

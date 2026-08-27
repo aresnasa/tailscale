@@ -111,7 +111,6 @@ func newUpFlagSet(goos string, upArgs *upArgsT, cmd string) *flag.FlagSet {
 	upf.Var(notFalseVar{}, "host-routes", hidden+"install host routes to other Tailscale nodes (must be true as of Tailscale 1.67+)")
 	upf.StringVar(&upArgs.exitNodeIP, "exit-node", "", "Tailscale exit node (IP, base name, or auto:any) for internet traffic, or empty string to not use an exit node")
 	upf.BoolVar(&upArgs.exitNodeAllowLANAccess, "exit-node-allow-lan-access", false, "allow direct access to the local network when routing traffic via an exit node")
-	upf.StringVar(&upArgs.ignoreRoutes, "ignore-routes", "", "routes that must bypass Tailscale and always use the system's own routing, even via an exit node or accepted subnet routes (comma-separated CIDRs, e.g. \"10.0.0.0/8,192.168.0.0/16\"), or empty string to clear")
 	upf.BoolVar(&upArgs.shieldsUp, "shields-up", false, "don't allow incoming connections")
 	upf.BoolVar(&upArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
 	upf.StringVar(&upArgs.advertiseTags, "advertise-tags", "", "comma-separated ACL tags to request (e.g. \"tag:eng,tag:montreal,tag:ssh\"); the \"tag:\" prefix is optional and added automatically when omitted (e.g. \"eng,montreal,ssh\")")
@@ -190,7 +189,6 @@ type upArgsT struct {
 	forceDaemon            bool
 	advertiseRoutes        string
 	advertiseDefaultRoute  bool
-	ignoreRoutes           string
 	advertiseTags          string
 	advertiseConnector     bool
 	snat                   bool
@@ -303,10 +301,6 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	if err != nil {
 		return nil, err
 	}
-	ignoreRoutes, err := parseIgnoreRoutes(upArgs.ignoreRoutes)
-	if err != nil {
-		return nil, err
-	}
 
 	if upArgs.exitNodeIP == "" && upArgs.exitNodeAllowLANAccess {
 		return nil, fmt.Errorf("--exit-node-allow-lan-access can only be used with --exit-node")
@@ -359,7 +353,6 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 	prefs.RunSSH = upArgs.runSSH
 	prefs.RunWebClient = upArgs.runWebClient
 	prefs.AdvertiseRoutes = routes
-	prefs.IgnoreRoutes = ignoreRoutes
 	prefs.AdvertiseTags = tags
 	prefs.Hostname = upArgs.hostname
 	prefs.ForceDaemon = upArgs.forceDaemon
@@ -393,34 +386,6 @@ func prefsFromUpArgs(upArgs upArgsT, warnf logger.Logf, st *ipnstate.Status, goo
 // netfilterModeFromFlag returns the preftype.NetfilterMode for the provided
 // flag value. It returns a warning if there is something the user should know
 // about the value.
-// parseIgnoreRoutes parses the comma-separated CIDR list for
-// --ignore-routes. An empty string yields nil (no ignores).
-func parseIgnoreRoutes(s string) ([]netip.Prefix, error) {
-	if s == "" {
-		return nil, nil
-	}
-	seen := make(map[netip.Prefix]bool)
-	var out []netip.Prefix
-	for part := range strings.SplitSeq(s, ",") {
-		part = strings.TrimSpace(part)
-		ipp, err := netip.ParsePrefix(part)
-		if err != nil {
-			return nil, fmt.Errorf("%q is not a valid CIDR prefix", part)
-		}
-		ipp = netip.PrefixFrom(ipp.Addr().Unmap(), ipp.Bits())
-		if ipp != ipp.Masked() {
-			return nil, fmt.Errorf("%s has non-address bits set; expected %s", ipp, ipp.Masked())
-		}
-		if seen[ipp] {
-			continue
-		}
-		seen[ipp] = true
-		out = append(out, ipp)
-	}
-	tsaddr.SortPrefixes(out)
-	return out, nil
-}
-
 func netfilterModeFromFlag(v string) (_ preftype.NetfilterMode, warning string, _ error) {
 	switch v {
 	case "on", "nodivert", "off":
@@ -937,7 +902,6 @@ func init() {
 	// Both these have the same ipn.Pref:
 	addPrefFlagMapping("advertise-exit-node", "AdvertiseRoutes")
 	addPrefFlagMapping("advertise-routes", "AdvertiseRoutes")
-	addPrefFlagMapping("ignore-routes", "IgnoreRoutes")
 
 	// And this flag has two ipn.Prefs:
 	addPrefFlagMapping("exit-node", "ExitNodeIP", "ExitNodeID")
@@ -1227,15 +1191,6 @@ func prefsToFlags(env upCheckEnv, prefs *ipn.Prefs) (flagVal map[string]any) {
 			set(sb.String())
 		case "advertise-exit-node":
 			set(tsaddr.ContainsExitRoutes(views.SliceOf(prefs.AdvertiseRoutes)))
-		case "ignore-routes":
-			var sb strings.Builder
-			for i, r := range prefs.IgnoreRoutes {
-				if i > 0 {
-					sb.WriteByte(',')
-				}
-				sb.WriteString(r.String())
-			}
-			set(sb.String())
 		case "advertise-connector":
 			set(prefs.AppConnector.Advertise)
 		case "snat-subnet-routes":

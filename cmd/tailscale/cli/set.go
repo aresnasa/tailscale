@@ -54,7 +54,6 @@ type setArgsT struct {
 	hostname                   string
 	advertiseRoutes            string
 	advertiseDefaultRoute      bool
-	ignoreRoutes               string
 	advertiseConnector         bool
 	opUser                     string
 	acceptedRisks              string
@@ -84,7 +83,6 @@ func newSetFlagSet(goos string, setArgs *setArgsT) *flag.FlagSet {
 	setf.BoolVar(&setArgs.runSSH, "ssh", false, "run an SSH server, permitting access per tailnet admin's declared policy")
 	setf.StringVar(&setArgs.hostname, "hostname", "", "hostname to use instead of the one provided by the OS")
 	setf.StringVar(&setArgs.advertiseRoutes, "advertise-routes", "", "routes to advertise to other nodes (comma-separated, e.g. \"10.0.0.0/8,192.168.0.0/24\") or empty string to not advertise routes")
-	setf.StringVar(&setArgs.ignoreRoutes, "ignore-routes", "", "routes that must bypass Tailscale and always use the system's own routing, even via an exit node or accepted subnet routes (comma-separated CIDRs, e.g. \"10.0.0.0/8,192.168.0.0/16\"), or empty string to clear")
 	setf.BoolVar(&setArgs.advertiseDefaultRoute, "advertise-exit-node", false, "offer to be an exit node for internet traffic for the tailnet")
 	setf.BoolVar(&setArgs.advertiseConnector, "advertise-connector", false, "offer to be an app connector for domain specific internet traffic for the tailnet")
 	setf.BoolVar(&setArgs.updateCheck, "update-check", true, "notify about available Tailscale updates")
@@ -217,12 +215,6 @@ func runSet(ctx context.Context, args []string) (retErr error) {
 	}
 	if maskedPrefs.AdvertiseRoutesSet {
 		maskedPrefs.AdvertiseRoutes, err = calcAdvertiseRoutesForSet(advertiseExitNodeSet, advertiseRoutesSet, curPrefs, setArgs)
-		if err != nil {
-			return err
-		}
-	}
-	if maskedPrefs.IgnoreRoutesSet {
-		maskedPrefs.IgnoreRoutes, err = parseIgnoreRoutes(setArgs.ignoreRoutes)
 		if err != nil {
 			return err
 		}

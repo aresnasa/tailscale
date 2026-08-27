@@ -14,6 +14,9 @@ cmd/tailscale/tailscale
 cmd/tailscaled/tailscaled
 ssh/tailssh/testcontainers/tailscaled
 
+# 个人部署笔记，不纳入版本库
+README_zhCN.md
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -46,7 +49,6 @@ client/web/build/assets
 
 /gocross
 /dist
-/config
 
 # Ignore xcode userstate and workspace data
 *.xcuserstate

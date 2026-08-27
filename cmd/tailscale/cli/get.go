@@ -145,15 +145,6 @@ func prefValue(flagName string, prefs *ipn.Prefs, st *ipnstate.Status) any {
 		return ""
 	case "exit-node-allow-lan-access":
 		return prefs.ExitNodeAllowLANAccess
-	case "ignore-routes":
-		var sb strings.Builder
-		for i, r := range prefs.IgnoreRoutes {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			sb.WriteString(r.String())
-		}
-		return sb.String()
 	case "shields-up":
 		return prefs.ShieldsUp
 	case "ssh":

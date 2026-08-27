@@ -125,16 +125,6 @@ type Prefs struct {
 	// RouteAll is whether advertised subnet routes (non-exit
 	// routes) from peers are accepted.
 	RouteAll bool
-
-	// IgnoreRoutes lists prefixes that must never be routed through
-	// Tailscale. A non-exit advertised route fully covered by one of
-	// these prefixes is excluded from routing entirely. For the exit
-	// routes (0.0.0.0/0 and ::/0), the OS route set instead carries
-	// the complement of these prefixes, so traffic to them uses the
-	// system's own routing (e.g. the physical network's default
-	// gateway) rather than the exit node. Peers' self addresses are
-	// never affected.
-	IgnoreRoutes []netip.Prefix
 }
 
 // TailnetConfig is tailnet-global and environment-derived
@@ -587,8 +577,7 @@ func (m *Mutation) Commit() Result {
 				res.PeersRemoved++
 			}
 		case opPrefs:
-			op.prefs.IgnoreRoutes = normalizeIgnoreRoutes(op.prefs.IgnoreRoutes)
-			if !prefsEqual(rm.prefs, op.prefs) {
+			if rm.prefs != op.prefs {
 				snapshotAll()
 				rm.prefs = op.prefs
 				res.PrefsChanged = true
@@ -665,113 +654,6 @@ func (m *Mutation) Commit() Result {
 // non-address bits.
 func normalizePrefix(p netip.Prefix) netip.Prefix {
 	return netip.PrefixFrom(p.Addr().Unmap(), p.Bits()).Masked()
-}
-
-// prefsEqual reports whether two routemanager Prefs are equal. The
-// structs contain slices, so they cannot be compared directly;
-// IgnoreRoutes is compared by value (callers normalize it).
-func prefsEqual(a, b Prefs) bool {
-	return a.ExitNodeID == b.ExitNodeID &&
-		a.ExitNodeSelected == b.ExitNodeSelected &&
-		a.RouteAll == b.RouteAll &&
-		slices.Equal(a.IgnoreRoutes, b.IgnoreRoutes)
-}
-
-// normalizeIgnoreRoutes returns a normalized copy of pfxs: unmapped,
-// masked, deduplicated, freed of entries covered by other entries,
-// and sorted, so that equal configurations compare equal and
-// coverage checks are well-defined.
-func normalizeIgnoreRoutes(pfxs []netip.Prefix) []netip.Prefix {
-	if len(pfxs) == 0 {
-		return nil
-	}
-	seen := make(map[netip.Prefix]bool, len(pfxs))
-	var dedup []netip.Prefix
-	for _, p := range pfxs {
-		p = normalizePrefix(p)
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		dedup = append(dedup, p)
-	}
-	// Drop entries covered by another entry; lists are small, so a
-	// quadratic scan is fine.
-	out := dedup[:0]
-	for i, p := range dedup {
-		covered := false
-		for j, q := range dedup {
-			if i != j && q.Bits() <= p.Bits() && q.Contains(p.Addr()) {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			out = append(out, p)
-		}
-	}
-	tsaddr.SortPrefixes(out)
-	return out
-}
-
-// subtractPrefixes returns the prefixes covering exactly the
-// addresses of base that are not covered by any prefix in excl.
-// The result is nil when base is fully covered. Prefixes overlap in
-// the usual nested way: an excl entry either contains base, is
-// contained by it, or does not overlap at all.
-func subtractPrefixes(base netip.Prefix, excl []netip.Prefix) []netip.Prefix {
-	covered := false
-	var overlapping bool
-	for _, q := range excl {
-		if q.Addr().Is4() != base.Addr().Is4() {
-			continue
-		}
-		if q.Overlaps(base) {
-			overlapping = true
-			if q.Bits() <= base.Bits() && q.Contains(base.Addr()) {
-				covered = true
-				break
-			}
-		}
-	}
-	if covered {
-		return nil
-	}
-	if !overlapping || base.IsSingleIP() {
-		return []netip.Prefix{base}
-	}
-	// Split base into its two children and recurse. The second
-	// child's address is the last address of base masked to the
-	// child prefix length.
-	lo := netip.PrefixFrom(base.Addr(), base.Bits()+1)
-	hi := netip.PrefixFrom(lastAddr(base), base.Bits()+1).Masked()
-	return append(subtractPrefixes(lo, excl), subtractPrefixes(hi, excl)...)
-}
-
-// lastAddr returns the last address of p.
-func lastAddr(p netip.Prefix) netip.Addr {
-	if p.Addr().Is4() {
-		a := p.Addr().As4()
-		mask := p.Bits()
-		for i := 0; i < 4; i++ {
-			if i*8 >= mask {
-				a[i] = 0xff
-			} else if (i+1)*8 > mask {
-				a[i] |= 0xff >> (mask - i*8)
-			}
-		}
-		return netip.AddrFrom4(a)
-	}
-	a := p.Addr().As16()
-	mask := p.Bits()
-	for i := 0; i < 16; i++ {
-		if i*8 >= mask {
-			a[i] = 0xff
-		} else if (i+1)*8 > mask {
-			a[i] |= 0xff >> (mask - i*8)
-		}
-	}
-	return netip.AddrFrom16(a)
 }
 
 // contribs returns the normalized per-prefix contributions of p,
@@ -952,25 +834,9 @@ func (rm *RouteManager) eligible(id tailcfg.NodeID, pfx netip.Prefix, kind contr
 		if tsaddr.IsExitRoute(pfx) {
 			return rm.prefs.ExitNodeID != 0 && id == rm.prefs.ExitNodeID
 		}
-		if rm.ignoredPrefix(pfx) {
-			// Fully covered by IgnoreRoutes: never routed via the
-			// tailnet, regardless of RouteAll.
-			return false
-		}
 		return rm.prefs.RouteAll
 	}
 	return kind&kindExtra != 0
-}
-
-// ignoredPrefix reports whether pfx is fully covered by one of the
-// configured IgnoreRoutes prefixes.
-func (rm *RouteManager) ignoredPrefix(pfx netip.Prefix) bool {
-	for _, ig := range rm.prefs.IgnoreRoutes {
-		if ig.Bits() <= pfx.Bits() && ig.Contains(pfx.Addr()) {
-			return true
-		}
-	}
-	return false
 }
 
 // desiredFor computes the desired output state for pfx from the
@@ -1046,15 +912,14 @@ func (rm *RouteManager) applyDirty(dirty set.Set[netip.Prefix], res *Result) {
 	var outChanged, osChanged bool
 
 	var cgnatDirty []netip.Prefix
-	exitDirty := false
 	for pfx := range dirty {
 		want, wantOS := rm.desiredFor(pfx)
-		isExit := tsaddr.IsExitRoute(pfx)
-		if isExit {
-			// Exit routes are installed into the OS route set as
-			// their IgnoreRoutes complements, after the loop, so that
-			// ignored prefixes keep using the system's own routing.
-			exitDirty = true
+		if rm.prefs.ExitNodeSelected && tsaddr.IsExitRoute(pfx) {
+			// The exit routes stay in the OS route set as long as an
+			// exit node is selected, even with no eligible
+			// contributor, to blackhole rather than leak internet
+			// traffic. See [Prefs.ExitNodeSelected].
+			wantOS = true
 		}
 
 		if cur, ok := out.Get(pfx); (want != nil) != ok || (ok && cur != want) {
@@ -1066,9 +931,6 @@ func (rm *RouteManager) applyDirty(dirty set.Set[netip.Prefix], res *Result) {
 			outChanged = true
 		}
 
-		if isExit {
-			continue
-		}
 		switch classify(pfx) {
 		case osULA:
 			if wantOS {
@@ -1088,13 +950,6 @@ func (rm *RouteManager) applyDirty(dirty set.Set[netip.Prefix], res *Result) {
 			osr, ch = tableSet(osr, pfx, wantOS)
 			osChanged = osChanged || ch
 		}
-	}
-
-	if exitDirty {
-		v4, v6 := rm.exitOSWanted()
-		var ch bool
-		osr, ch = rm.applyExitOSRoutes(osr, v4, v6)
-		osChanged = osChanged || ch
 	}
 
 	var ch bool
@@ -1119,54 +974,6 @@ func (rm *RouteManager) applyDirty(dirty set.Set[netip.Prefix], res *Result) {
 	rm.publish(out, outChanged, osr, osChanged, res)
 }
 
-// exitOSWanted reports, per address family, whether the family's
-// exit route should be reflected in the OS route set: an eligible
-// exit-node contributor carries its traffic, or ExitNodeSelected
-// blackholes it while the selection is unresolved.
-func (rm *RouteManager) exitOSWanted() (v4, v6 bool) {
-	for _, def := range tsaddr.ExitRoutes() {
-		if _, os := rm.desiredFor(def); os {
-			if def.Addr().Is4() {
-				v4 = true
-			} else {
-				v6 = true
-			}
-		}
-	}
-	if rm.prefs.ExitNodeSelected {
-		v4, v6 = true, true
-	}
-	return v4, v6
-}
-
-// applyExitOSRoutes updates t so that the exit routes are
-// represented by their IgnoreRoutes complements: the /0s themselves
-// are never installed directly; for each wanted family whose
-// default route is not itself ignored, the complement prefixes are
-// installed (or removed, when the family is no longer wanted). It
-// returns the updated table and whether anything changed.
-func (rm *RouteManager) applyExitOSRoutes(t *bart.Lite, v4, v6 bool) (*bart.Lite, bool) {
-	var changed bool
-	var ch bool
-	for _, def := range tsaddr.ExitRoutes() {
-		want := v4
-		if def.Addr().Is6() {
-			want = v6
-		}
-		t, ch = tableSet(t, def, false)
-		changed = changed || ch
-		if rm.ignoredPrefix(def) {
-			// The whole family is ignored; nothing to install.
-			continue
-		}
-		for _, p := range subtractPrefixes(def, rm.prefs.IgnoreRoutes) {
-			t, ch = tableSet(t, p, want)
-			changed = changed || ch
-		}
-	}
-	return t, changed
-}
-
 // rebuildAll recomputes the output snapshots from scratch and
 // publishes those that changed. It runs on prefs or tailnet config
 // changes, where O(number of prefixes) work is acceptable.
@@ -1177,10 +984,6 @@ func (rm *RouteManager) rebuildAll(res *Result) {
 	clear(rm.ulaPfxs)
 
 	var plain []netip.Prefix
-	// Exit coverage is wanted per family when an eligible exit peer
-	// contributes it or an exit node is selected but unresolved (the
-	// blackhole); see [Prefs.ExitNodeSelected].
-	exitV4, exitV6 := rm.prefs.ExitNodeSelected, rm.prefs.ExitNodeSelected
 	for pfx := range rm.byPrefix {
 		want, wantOS := rm.desiredFor(pfx)
 		if want == nil {
@@ -1188,15 +991,6 @@ func (rm *RouteManager) rebuildAll(res *Result) {
 		}
 		out.Insert(pfx, want)
 		if !wantOS {
-			continue
-		}
-		if tsaddr.IsExitRoute(pfx) {
-			// Installed as IgnoreRoutes complements below.
-			if pfx.Addr().Is4() {
-				exitV4 = true
-			} else {
-				exitV6 = true
-			}
 			continue
 		}
 		switch classify(pfx) {
@@ -1212,7 +1006,13 @@ func (rm *RouteManager) rebuildAll(res *Result) {
 	for _, pfx := range plain {
 		osr.Insert(pfx)
 	}
-	osr, _ = rm.applyExitOSRoutes(osr, exitV4, exitV6)
+	if rm.prefs.ExitNodeSelected {
+		// Blackhole (or carry) internet traffic while any exit node
+		// is selected, resolved or not. See [Prefs.ExitNodeSelected].
+		for _, pfx := range tsaddr.ExitRoutes() {
+			osr.Insert(pfx)
+		}
+	}
 	if len(rm.ulaPfxs) > 0 {
 		osr.Insert(tsaddr.TailscaleULARange())
 	}

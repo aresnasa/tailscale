@@ -251,14 +251,6 @@ type Impl struct {
 	// This is currently only used in tests.
 	forwardDialFunc netx.DialFunc
 
-	// forwardProxyDialer, if non-nil, is used instead of a plain net.Dialer
-	// to dial outbound connections for forwarded TCP flows (exit-node /
-	// subnet-router traffic). It is populated from the TS_FORWARD_PROXY
-	// environment variable (e.g. "socks5://127.0.0.1:7891" or
-	// "http://127.0.0.1:7890"), letting an exit node forward its egress
-	// through a local proxy such as Clash Verge.
-	forwardProxyDialer netx.DialFunc
-
 	// forwardInFlightPerClientDropped is a metric that tracks how many
 	// in-flight TCP forward requests were dropped due to the per-client
 	// limit.
@@ -450,7 +442,6 @@ func Create(logf logger.Logf, tundev *tstun.Wrapper, e wgengine.Engine, mc *magi
 	ns.atomicIsVIPServiceIPFunc.Store(ipset.FalseContainsIPFunc())
 	ns.tundev.PostFilterPacketInboundFromWireGuard = ns.injectInbound
 	ns.tundev.PreFilterPacketOutboundToWireGuardNetstackIntercept = ns.handleLocalPackets
-	ns.forwardProxyDialer = newForwardProxyDialer(logf)
 	stacksForMetrics.Store(ns, struct{}{})
 	return ns, nil
 }
@@ -1779,12 +1770,9 @@ func (ns *Impl) forwardTCP(getClient func(...tcpip.SettableSocketOption) *gonet.
 
 	// Attempt to dial the outbound connection before we accept the inbound one.
 	var dialFunc netx.DialFunc
-	switch {
-	case ns.forwardDialFunc != nil:
+	if ns.forwardDialFunc != nil {
 		dialFunc = ns.forwardDialFunc
-	case ns.forwardProxyDialer != nil:
-		dialFunc = ns.forwardProxyDialer
-	default:
+	} else {
 		var stdDialer net.Dialer
 		dialFunc = stdDialer.DialContext
 	}

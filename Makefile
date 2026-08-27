@@ -1,200 +1,212 @@
-# Makefile —— 通过 ./build_dist.sh 交叉编译 Tailscale 二进制（tailscale + tailscaled）
-# 并生成样例部署配置，保证 tailscaled 与 tailscale CLI 正确连通
-# 产物统一输出到 $(BIN_DIR)/（默认 dist/），命名: <bin>-<os>-<arch>[.exe]
+IMAGE_REPO ?= tailscale/tailscale
+SYNO_ARCH ?= "x86_64"
+SYNO_DSM ?= "7"
+TAGS ?= "latest"
 
-.DEFAULT_GOAL := build
+PLATFORM ?= "flyio" ## flyio==linux/amd64. Set to "" to build all platforms.
 
-GOOS   ?= linux
-GOARCH ?= amd64
+vet: ## Run go vet
+	./tool/go vet ./...
 
-# 交叉编译统一禁用 cgo，无需安装交叉 C 工具链
-CGO_ENABLED ?= 0
+tidy: ## Run go mod tidy and update nix flake hashes
+	./tool/go mod tidy
+	./tool/go run ./tool/updateflakes
 
-PKGS    ?= tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
-BIN_DIR ?= dist
+lint: ## Run golangci-lint
+	./tool/go run github.com/golangci/golangci-lint/cmd/golangci-lint run
 
-# ---- 样例配置相关（make config）----
-CONF_DIR       ?= config
-TS_STATE_DIR   ?= /var/lib/tailscale
-TS_SOCKET      ?= /var/run/tailscale/tailscaled.sock
-TS_PORT        ?= 41641
-TS_INSTALL_DIR ?= /usr/local/bin
+updatedeps: ## Update depaware deps
+	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
+	# it finds in its $$PATH is the right one.
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update --vendor --internal \
+		tailscale.com/cmd/tailscaled \
+		tailscale.com/cmd/tailscale \
+		tailscale.com/cmd/derper \
+		tailscale.com/cmd/k8s-operator \
+		tailscale.com/cmd/stund \
+		tailscale.com/cmd/tsidp
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update --goos=linux,darwin,windows,android,ios --vendor --internal \
+		tailscale.com/tsnet
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update --file=depaware-minbox.txt --goos=linux --tags="$$(./tool/go run ./cmd/featuretags --min --add=cli)" --vendor --internal \
+		tailscale.com/cmd/tailscaled
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --update --file=depaware-min.txt --goos=linux --tags="$$(./tool/go run ./cmd/featuretags --min)" --vendor --internal \
+		tailscale.com/cmd/tailscaled
 
-# 平台矩阵：linux/amd64 为主要目标，其余按需增删
-PLATFORMS := linux/amd64 linux/arm64 linux/arm \
-             darwin/amd64 darwin/arm64 \
-             windows/amd64
+depaware: ## Run depaware checks
+	# depaware (via x/tools/go/packages) shells back to "go", so make sure the "go"
+	# it finds in its $$PATH is the right one.
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --vendor --internal \
+		tailscale.com/cmd/tailscaled \
+		tailscale.com/cmd/tailscale \
+		tailscale.com/cmd/derper \
+		tailscale.com/cmd/k8s-operator \
+		tailscale.com/cmd/stund \
+		tailscale.com/cmd/tsidp
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --goos=linux,darwin,windows,android,ios --vendor --internal \
+		tailscale.com/tsnet
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --file=depaware-minbox.txt --goos=linux --tags="$$(./tool/go run ./cmd/featuretags --min --add=cli)" --vendor --internal \
+		tailscale.com/cmd/tailscaled
+	PATH="$$(./tool/go env GOROOT)/bin:$$PATH" ./tool/go run github.com/tailscale/depaware --check --file=depaware-min.txt --goos=linux --tags="$$(./tool/go run ./cmd/featuretags --min)" --vendor --internal \
+		tailscale.com/cmd/tailscaled
 
-ifeq ($(GOOS),windows)
-EXT := .exe
-else
-EXT :=
-endif
+buildwindows: ## Build tailscale CLI for windows/amd64
+	GOOS=windows GOARCH=amd64 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
 
-.PHONY: all build list clean help config config-dir
+build386: ## Build tailscale CLI for linux/386
+	GOOS=linux GOARCH=386 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
 
-all: $(foreach p,$(PLATFORMS),build-$(subst /,-,$(p))) ## 构建全部平台矩阵（建议 make all -j 并行）
+buildlinuxarm: ## Build tailscale CLI for linux/arm
+	GOOS=linux GOARCH=arm ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
 
-# 构建 $(GOOS)/$(GOARCH)（默认 linux/amd64）上 PKGS 列表中的所有二进制
-build: ## 构建 $(GOOS)/$(GOARCH)（默认 linux/amd64）的 tailscale + tailscaled
-	@mkdir -p $(BIN_DIR)
-	@set -e; for pkg in $(PKGS); do \
-		bin=$$(basename $$pkg); \
-		GOOS=$(GOOS) GOARCH=$(GOARCH) CGO_ENABLED=$(CGO_ENABLED) \
-			./build_dist.sh -o $(BIN_DIR)/$$bin-$(GOOS)-$(GOARCH)$(EXT) $$pkg; \
-		echo "==> $(BIN_DIR)/$$bin-$(GOOS)-$(GOARCH)$(EXT)"; \
+buildwasm: ## Build tailscale CLI for js/wasm
+	GOOS=js GOARCH=wasm ./tool/go install ./cmd/tsconnect/wasm ./cmd/tailscale/cli
+
+buildplan9:
+	GOOS=plan9 GOARCH=amd64 ./tool/go install ./cmd/tailscale ./cmd/tailscaled
+
+buildlinuxloong64: ## Build tailscale CLI for linux/loong64
+	GOOS=linux GOARCH=loong64 ./tool/go install tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled
+
+buildmultiarchimage: ## Build (and optionally push) multiarch docker image
+	./build_docker.sh
+
+check: staticcheck vet depaware buildwindows build386 buildlinuxarm buildwasm ## Perform basic checks and compilation tests
+
+staticcheck: ## Run staticcheck.io checks
+	./tool/go run honnef.co/go/tools/cmd/staticcheck -- $$(./tool/go run ./tool/listpkgs --ignore-3p  ./...)
+
+kube-generate-all: kube-generate-deepcopy ## Refresh generated files for Tailscale Kubernetes Operator
+	./tool/go generate ./cmd/k8s-operator
+
+# Tailscale operator watches Connector custom resources in a Kubernetes cluster
+# and caches them locally. Caching is done implicitly by controller-runtime
+# library (the middleware used by Tailscale operator to create kube control
+# loops). When a Connector resource is GET/LIST-ed from within our control loop,
+# the request goes through the cache. To ensure that cache contents don't get
+# modified by control loops, controller-runtime deep copies the requested
+# object. In order for this to work, Connector must implement deep copy
+# functionality so we autogenerate it here.
+# https://github.com/kubernetes-sigs/controller-runtime/blob/v0.16.3/pkg/cache/internal/cache_reader.go#L86-L89
+kube-generate-deepcopy: ## Refresh generated deepcopy functionality for Tailscale kube API types
+	./scripts/kube-deepcopy.sh
+
+spk: ## Build synology package for ${SYNO_ARCH} architecture and ${SYNO_DSM} DSM version
+	./tool/go run ./cmd/dist build synology/dsm${SYNO_DSM}/${SYNO_ARCH}
+
+spkall: ## Build synology packages for all architectures and DSM versions
+	./tool/go run ./cmd/dist build synology
+
+pushspk: spk ## Push and install synology package on ${SYNO_HOST} host
+	echo "Pushing SPK to root@${SYNO_HOST} (env var SYNO_HOST) ..."
+	scp tailscale.spk root@${SYNO_HOST}:
+	ssh root@${SYNO_HOST} /usr/syno/bin/synopkg install tailscale.spk
+
+.PHONY: check-image-repo
+check-image-repo:
+	@if [ -z "$(REPO)" ]; then \
+		echo "REPO=... required; e.g. REPO=ghcr.io/$$USER/tailscale" >&2; \
+		exit 1; \
+	fi
+	@for repo in tailscale/tailscale ghcr.io/tailscale/tailscale \
+		tailscale/k8s-operator ghcr.io/tailscale/k8s-operator \
+		tailscale/k8s-nameserver ghcr.io/tailscale/k8s-nameserver \
+		tailscale/tsidp ghcr.io/tailscale/tsidp \
+		tailscale/k8s-proxy ghcr.io/tailscale/k8s-proxy; do \
+		if [ "$(REPO)" = "$$repo" ]; then \
+			echo "REPO=... must not be $$repo" >&2; \
+			exit 1; \
+		fi; \
 	done
 
-build-%: ## 构建指定平台，如 make build-linux-arm64（平台见 make list）
-	@$(MAKE) --no-print-directory build \
-		GOOS=$(word 1,$(subst -, ,$*)) GOARCH=$(word 2,$(subst -, ,$*))
+publishdevimage: check-image-repo ## Build and publish tailscale image to location specified by ${REPO}
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=client ./build_docker.sh
 
-list: ## 列出平台矩阵与构建的包
-	@echo "平台矩阵:"
-	@for p in $(PLATFORMS); do echo "  $$p"; done
-	@echo "构建的包（PKGS）:"
-	@for pkg in $(PKGS); do echo "  $$pkg"; done
+publishdevoperator: check-image-repo ## Build and publish k8s-operator image to location specified by ${REPO}
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=k8s-operator ./build_docker.sh
 
-clean: ## 删除产物目录 $(BIN_DIR)/
-	rm -rf $(BIN_DIR)
+publishdevnameserver: check-image-repo ## Build and publish k8s-nameserver image to location specified by ${REPO}
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=k8s-nameserver ./build_docker.sh
 
-# ---- 样例配置模板 ----
-# 说明: 模板中的 $$ 转义为生成文件内的 $（运行期变量展开）
+publishdevtsidp: check-image-repo ## Build and publish tsidp image to location specified by ${REPO}
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=tsidp ./build_docker.sh
 
-define config_env
-# Tailscale 部署配置 —— tailscaled 与 tailscale CLI 共享
-# 连通关键: 两个进程必须使用同一个 TS_SOCKET 与 TS_STATE_DIR
-TS_STATE_DIR=$(TS_STATE_DIR)
-TS_SOCKET=$(TS_SOCKET)
-TS_PORT=$(TS_PORT)
-# 追加给 tailscaled 的额外参数（tailscaled.service 的 ExecStart 会展开 $$FLAGS）
-FLAGS=
-endef
+publishdevproxy: check-image-repo ## Build and publish k8s-proxy image to location specified by ${REPO}
+	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=k8s-proxy ./build_docker.sh
 
-define config_service
-[Unit]
-Description=Tailscale node agent
-Documentation=https://tailscale.com/docs/
-Wants=network-pre.target
-After=network-pre.target NetworkManager.service systemd-resolved.service
+.PHONY: sshintegrationtest
+sshintegrationtest: ## Run the SSH integration tests in various Docker containers
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 ./tool/go test -tags integrationtest -c ./ssh/tailssh -o ssh/tailssh/testcontainers/tailssh.test && \
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 ./tool/go build -o ssh/tailssh/testcontainers/tailscaled ./cmd/tailscaled && \
+	echo "Testing on ubuntu:focal, ubuntu:jammy, ubuntu:noble, alpine:latest (in parallel)" && \
+	docker build --build-arg="BASE=ubuntu:focal" -t ssh-ubuntu-focal ssh/tailssh/testcontainers & \
+	docker build --build-arg="BASE=ubuntu:jammy" -t ssh-ubuntu-jammy ssh/tailssh/testcontainers & \
+	docker build --build-arg="BASE=ubuntu:noble" -t ssh-ubuntu-noble ssh/tailssh/testcontainers & \
+	docker build --build-arg="BASE=alpine:latest" -t ssh-alpine-latest ssh/tailssh/testcontainers & \
+	wait
 
-[Service]
-EnvironmentFile=/etc/default/tailscaled
-ExecStart=$(TS_INSTALL_DIR)/tailscaled --statedir=$${TS_STATE_DIR} --socket=$${TS_SOCKET} --port=$${TS_PORT} $$FLAGS
-ExecStopPost=$(TS_INSTALL_DIR)/tailscaled --cleanup --statedir=$${TS_STATE_DIR}
-Restart=on-failure
-RuntimeDirectory=tailscale
-RuntimeDirectoryMode=0755
-StateDirectory=tailscale
-StateDirectoryMode=0700
-CacheDirectory=tailscale
-CacheDirectoryMode=0750
-Type=notify
+.PHONY: generate
+generate: ## Generate code
+	./tool/go generate ./...
 
-[Install]
-WantedBy=multi-user.target
-endef
+.PHONY: tsapp-build-and-flash-pi
+tsapp-build-and-flash-pi: ## Build a tsapp-pi.arm64 GAF from HEAD and flash a local SD card (macOS auto-detects the disk; pass DISK=/dev/sdX on Linux)
+	cd gokrazy && ../tool/go run build.go --gaf --app=tsapp-pi.arm64
+	./tool/go run --exec=sudo ./cmd/tailscale configure flash-appliance \
+		--variant=pi-arm64 \
+		--gaf=gokrazy/tsapp-pi.arm64.gaf \
+		$(if $(DISK),--disk=$(DISK)) \
+		$(if $(wildcard $(HOME)/.ssh/id_ed25519.pub),--add-ssh-authorized-keys=$(HOME)/.ssh/id_ed25519.pub)
 
-define config_run_sh
-#!/bin/sh
-# 手动运行 tailscaled（生产环境建议 systemd，见 tailscaled.service）
-# 需要 root（TUN 权限）; 无 root 测试可追加: --tun=userspace-networking
-set -eu
-CONF_DIR=$$(cd "$$(dirname "$$0")" && pwd)
-. "$$CONF_DIR/tailscaled.env"
-mkdir -p "$$TS_STATE_DIR"
-exec tailscaled \
-	--statedir="$$TS_STATE_DIR" \
-	--socket="$$TS_SOCKET" \
-	--port="$$TS_PORT" \
-	"$$@"
-endef
+.PHONY: tsapp-qemu-pi
+tsapp-qemu-pi: ## Build tsapp-pi.arm64 and boot it under qemu-system-aarch64 with a framebuffer GUI window and working network (requires mtools, dtc, qemu-efi-aarch64)
+	cd gokrazy && ../tool/go run build.go --build --app=tsapp-pi.arm64
+	# Extract the kernel from the FAT boot partition for direct -kernel boot.
+	rm -f gokrazy/tsapp-pi.arm64.vmlinuz
+	mcopy -i gokrazy/tsapp-pi.arm64.img@@4194304 ::vmlinuz gokrazy/tsapp-pi.arm64.vmlinuz
+	# Use the "virt" machine (not raspi3b) because it provides working
+	# PCI e1000 networking and, with UEFI firmware, an EFI framebuffer
+	# via the ramfb device. The raspi3b machine's USB NIC emulation is
+	# too broken for DHCP and its SoC watchdog reboots the guest.
+	#
+	# Find the UEFI firmware. Common paths:
+	#   Debian/Ubuntu: /usr/share/qemu-efi-aarch64/QEMU_EFI.fd
+	#   Homebrew:      /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+	#   Fedora:        /usr/share/edk2/aarch64/QEMU_EFI.fd
+	QEMU_EFI=$$(for f in \
+		/usr/share/qemu-efi-aarch64/QEMU_EFI.fd \
+		/opt/homebrew/share/qemu/edk2-aarch64-code.fd \
+		/usr/share/edk2/aarch64/QEMU_EFI.fd \
+		$$(dirname $$(which qemu-system-aarch64))/../share/qemu/edk2-aarch64-code.fd; do \
+		[ -f "$$f" ] && echo "$$f" && break; \
+	done) && \
+	[ -n "$$QEMU_EFI" ] || { echo "error: cannot find QEMU EFI firmware (install qemu-efi-aarch64)"; exit 1; } && \
+	qemu-system-aarch64 \
+		-M virt -cpu cortex-a53 -m 1G \
+		-bios "$$QEMU_EFI" \
+		-device ramfb \
+		-device e1000,netdev=net0 -netdev user,id=net0 \
+		-kernel gokrazy/tsapp-pi.arm64.vmlinuz \
+		-append "console=ttyAMA0,115200 nowatchdog gokrazy.log_to_serial=1 root=PARTUUID=60c24cc1-f3f9-427a-8199-dd02023b0001/PARTNROFF=1 ro init=/gokrazy/init rootwait" \
+		-drive file=gokrazy/tsapp-pi.arm64.img,format=raw,if=none,id=disk0 \
+		-device virtio-blk-device,drive=disk0 \
+		-serial mon:stdio
 
-define config_cli_sh
-#!/bin/sh
-# tailscale CLI 包装: 自动使用与 tailscaled 相同的 socket，保证连通
-# 用法: ./tailscale.sh status | up --authkey=tskey-xxx | netcheck | ...
-set -eu
-CONF_DIR=$$(cd "$$(dirname "$$0")" && pwd)
-. "$$CONF_DIR/tailscaled.env"
-exec tailscale --socket="$$TS_SOCKET" "$$@"
-endef
+.PHONY: tsapp-push-pi
+tsapp-push-pi: ## Build a tsapp-pi.arm64 GAF from HEAD and push it to a running Pi over the network (pass PI=<ip>)
+	@[ -n "$(PI)" ] || { echo "usage: make tsapp-push-pi PI=<ip-address>"; exit 1; }
+	cd gokrazy && ../tool/go run build.go --gaf --app=tsapp-pi.arm64
+	./tool/go run ./gokrazy/gafpush --gaf=gokrazy/tsapp-pi.arm64.gaf --pi=$(PI)
 
-define config_readme
-# Tailscale 部署样例配置（由 make config 生成）
+.PHONY: pin-github-actions
+pin-github-actions:
+	./tool/go tool github.com/stacklok/frizbee actions .github/workflows
 
-本目录供部署 linux/amd64 使用（二进制在 $(BIN_DIR)/ 目录）。文件说明:
+help: ## Show this help
+	@echo ""
+	@echo "Specify a command. The choices are:"
+	@echo ""
+	@grep -hE '^[0-9a-zA-Z_-]+:.*?## .*$$' ${MAKEFILE_LIST} | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[0;36m%-20s\033[m %s\n", $$1, $$2}'
+	@echo ""
+.PHONY: help
 
-- tailscaled.env     tailscaled 与 CLI 的共享配置（连通核心: TS_SOCKET 必须一致）
-- tailscaled.service systemd 服务样例（参考上游 cmd/tailscaled/tailscaled.service）
-- run-tailscaled.sh  无 systemd 时手动运行 tailscaled
-- tailscale.sh       tailscale CLI 包装，自动携带 --socket 参数
-- README.md          本说明
-
-## Linux 部署步骤（root，目标机）
-
-1. 复制二进制并按平台改名:
-   scp $(BIN_DIR)/tailscale-linux-amd64  root@HOST:$(TS_INSTALL_DIR)/tailscale
-   scp $(BIN_DIR)/tailscaled-linux-amd64 root@HOST:$(TS_INSTALL_DIR)/tailscaled
-2. 复制配置:
-   scp config/tailscaled.env      root@HOST:/etc/default/tailscaled
-   scp config/tailscaled.service  root@HOST:/etc/systemd/system/tailscaled.service
-3. 启动并登录:
-   systemctl daemon-reload && systemctl enable --now tailscaled
-   tailscale up --authkey=tskey-xxx --hostname=HOSTNAME
-
-也可用本目录脚本代替第 3 步的 CLI 部分: ./tailscale.sh up --authkey=tskey-xxx
-
-## 连通原理（tailscale 如何找到 tailscaled）
-
-- tailscale CLI 通过 unix socket 与本机 tailscaled 通信;
-  两者必须使用同一路径（tailscaled --socket 与 tailscale --socket）。
-- tailscaled 需要对 statedir 有写权限; systemd 单元已用 StateDirectory 托管。
-- WireGuard 流量走 UDP，注意防火墙放行 TS_PORT（默认 41641/udp）。
-
-## 无 root 本地测试（如容器/开发机）
-
-./run-tailscaled.sh --tun=userspace-networking   # 免 TUN 权限运行 daemon
-./tailscale.sh status                             # 验证 CLI 与 daemon 连通
-
-## 重新生成（路径可覆盖）
-
-make config TS_SOCKET=/tmp/t.sock TS_STATE_DIR=/tmp/state CONF_DIR=/tmp/conf
-endef
-
-config-dir:
-	@mkdir -p $(CONF_DIR)
-
-config: | config-dir ## 生成样例部署配置到 $(CONF_DIR)/（env + systemd + 连通脚本 + README）
-	@$(file >$(CONF_DIR)/tailscaled.env,$(config_env))
-	@printf '\n' >> $(CONF_DIR)/tailscaled.env
-	@$(file >$(CONF_DIR)/tailscaled.service,$(config_service))
-	@printf '\n' >> $(CONF_DIR)/tailscaled.service
-	@$(file >$(CONF_DIR)/run-tailscaled.sh,$(config_run_sh))
-	@printf '\n' >> $(CONF_DIR)/run-tailscaled.sh
-	@$(file >$(CONF_DIR)/tailscale.sh,$(config_cli_sh))
-	@printf '\n' >> $(CONF_DIR)/tailscale.sh
-	@$(file >$(CONF_DIR)/README.md,$(config_readme))
-	@printf '\n' >> $(CONF_DIR)/README.md
-	@chmod +x $(CONF_DIR)/run-tailscaled.sh $(CONF_DIR)/tailscale.sh
-	@echo "==> $(CONF_DIR)/: tailscaled.env tailscaled.service run-tailscaled.sh tailscale.sh README.md"
-	@echo "    部署说明见 $(CONF_DIR)/README.md"
-
-help: ## 显示此帮助
-	@echo "Tailscale 交叉编译（产物: $(BIN_DIR)/<bin>-<os>-<arch>）"
-	@echo
-	@echo "常用目标:"
-	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z0-9_%-]+:.*##/ {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-	@echo
-	@echo "构建 linux/amd64（主要目标）:"
-	@echo "  make          # 即 make build: 构建 linux/amd64 的 tailscale + tailscaled → $(BIN_DIR)/"
-	@echo
-	@echo "其他示例:"
-	@echo "  make config                            # 生成样例配置（tailscaled/CLI 连通所需）→ $(CONF_DIR)/"
-	@echo "  make config TS_SOCKET=/tmp/t.sock TS_STATE_DIR=/tmp/state  # 自定义路径"
-	@echo "  make build-linux-arm64                # 单独构建某平台（平台见 make list）"
-	@echo "  make build GOOS=windows GOARCH=amd64  # 任意指定平台"
-	@echo "  make all -j                           # 并行构建全部平台矩阵"
-	@echo
-	@echo "可覆盖变量: GOOS GOARCH PKGS PLATFORMS BIN_DIR"
-	@echo "配置变量:   CONF_DIR TS_STATE_DIR TS_SOCKET TS_PORT TS_INSTALL_DIR"
+.DEFAULT_GOAL := help
