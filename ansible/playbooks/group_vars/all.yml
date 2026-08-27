@@ -61,7 +61,7 @@ ts_exit_node: "mac-mini"
 #   10.0.0.0/8、172.16.0.0/12、192.168.0.0/16
 # 覆盖物理网卡 LAN、Docker bridge、K8s pod/service、CNI 等所有内网场景。
 # 在 host_vars 手动设置 ts_ignore_routes 则覆盖自动检测。
-# 也可在目标机写 /etc/tailscale/custom-ignore-routes.conf 精确指定网段。
+# 也可在目标机写 /etc/tailscale/custom-lan-routes.conf 精确指定网段。
 #
 # deploy.yml 会在 tailscale up 后运行 lan-access 步骤，在 ip rule priority 5260
 # （< Tailscale 5270）插入 to <CIDR> lookup main 规则，让内网网段双向走 main 表。
@@ -82,8 +82,8 @@ ts_bypass_hosts:
 # 与 ts_bypass_hosts 互补：让指定域名的流量强制经 Tailscale 隧道（exit node）传输，
 # 即使该域名解析的 IP 落在 ts_ignore_routes 网段内（否则默认直连不走隧道）。
 # 原理：ip rule 优先级 5050（< bypass 5100 < tailscale 5270）→ to <IP> lookup table 52，
-#       并在 table 52 补 <IP>/32 dev tailscale0 路由（仅 ignore-routes 网段内才需要）。
-# 公网 IP（不在 ignore-routes 内）默认已走 exit node，无需额外处理，
+#       并在 table 52 补 <IP>/32 dev tailscale0 路由（仅 ts_ignore_routes 网段内才需要）。
+# 公网 IP（不在 ts_ignore_routes 内）默认已走 exit node，无需额外处理，
 # 但若之前被 bypass 过则会被 5050 规则提前命中，纠正回隧道。
 # 由 playbooks/force-tunnel.yml 管理；必须在 tailscale up --exit-node 之后运行。
 ts_force_tunnel_hosts:

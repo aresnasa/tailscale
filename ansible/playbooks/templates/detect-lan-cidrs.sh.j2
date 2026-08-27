@@ -17,10 +17,10 @@
 #
 # 用法: detect-lan-cidrs.sh
 
-# 如果有自定义配置文件 /etc/tailscale/custom-ignore-routes.conf，优先用它
+# 如果有自定义配置文件 /etc/tailscale/custom-lan-routes.conf，优先用它
 # （管理员可在此文件中精确指定要忽略的网段，覆盖默认的三大段）
-if [ -f /etc/tailscale/custom-ignore-routes.conf ]; then
-    grep -v '^[[:space:]]*#' /etc/tailscale/custom-ignore-routes.conf \
+if [ -f /etc/tailscale/custom-lan-routes.conf ]; then
+    grep -v '^[[:space:]]*#' /etc/tailscale/custom-lan-routes.conf \
         | grep -v '^[[:space:]]*$' \
         | sort -u
     exit 0

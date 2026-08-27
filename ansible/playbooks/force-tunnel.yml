@@ -9,12 +9,12 @@
 #   - Tailscale ipPolicyPrefBase=5200，实际 ip rule 优先级：
 #       5210 fwmark→main  5230 fwmark→default  5250 fwmark→unreachable  5270 all→table 52
 #   - exit node 流量在 table 52 匹配 0.0.0.0/1 + 128.0.0.0/1 → 走 tailscale0
-#   - ignore-routes 网段（如 10.0.0.0/8）不在 table 52 中 → 5270 fallthrough → main 直连
+#   - 内网网段（ts_ignore_routes，如 10.0.0.0/8）由 lan-access 的 ip rule 5260 拦截 → main 直连
 #   - bypass.yml 用 5100（< 5270）让特定 IP 走 main 直连
 #
 #   force-tunnel 策略（与 bypass 对称、优先级更高）:
 #     ip rule 优先级 5050（< bypass 5100 < tailscale 5270）→ to <IP> lookup table 52
-#     + table 52 补 <IP>/32 dev tailscale0 路由（仅 ignore-routes 网段内才需要补）
+#     + table 52 补 <IP>/32 dev tailscale0 路由（仅 ts_ignore_routes 网段内才需要补）
 #   → 内核在 bypass(5100) 和 tailscale(5270) 之前命中 5050 → 查 table 52 → 走 tailscale0
 #
 # 必须在 tailscale up --exit-node 之后运行才有效（之前直连是默认行为）。

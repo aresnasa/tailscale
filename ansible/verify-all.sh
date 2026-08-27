@@ -56,19 +56,10 @@ else
     exit 1
 fi
 
-# 4. Mac TS_FORWARD_PROXY
-info "4. 检查 Mac TS_FORWARD_PROXY 环境变量"
-PID=$(pgrep -f 'tailscaled.*userspace' | head -1)
-if [ -n "$PID" ]; then
-    PROXY_ENV=$(ps -p "$PID" -wwwE 2>/dev/null | tr ' ' '\n' | grep "TS_FORWARD_PROXY" || echo "")
-    if [ -n "$PROXY_ENV" ]; then
-        pass "tailscaled 进程有 $PROXY_ENV"
-    else
-        fail "tailscaled 进程缺少 TS_FORWARD_PROXY"
-        echo "  重跑: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags install --limit local"
-        exit 1
-    fi
-fi
+# 4. Mac exit node 转发路径（Clash TUN/增强模式）
+info "4. 检查 Mac exit node 转发路径（Clash TUN/增强模式）"
+echo "  exit node 的转发流量走系统默认出站路径。"
+echo "  请确认 Clash Verge 已开启 TUN/增强模式，否则被墙站点（GitHub/Google）会失败。"
 
 # 5. 217 tailscale 状态
 info "5. 检查 217 tailscale 状态"
@@ -85,7 +76,7 @@ else
 fi
 
 # 6. 217 内网直连
-info "6. 检查 217 内网直连（ignore-routes + lan-access）"
+info "6. 检查 217 内网直连（lan-access）"
 GW_PING=$(ssh "$REMOTE_HOST" 'ping -c 1 -W 2 10.9.202.1 2>&1' 2>/dev/null)
 if echo "$GW_PING" | grep -q "0% packet loss"; then
     pass "217 内网网关 10.9.202.1 可达（直连）"
@@ -102,14 +93,14 @@ else
     echo "  修复: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags lan"
 fi
 
-# 7. 217 ignore-routes
-info "7. 检查 217 ignore-routes 配置"
-IGNORE_PREFS=$(ssh "$REMOTE_HOST" 'tailscale --socket=/var/run/tailscale/tailscaled.sock debug prefs 2>&1 | grep -A5 "IgnoreRoutes"' 2>/dev/null)
-if echo "$IGNORE_PREFS" | grep -q "10.0.0.0/8"; then
-    pass "217 IgnoreRoutes 包含 10.0.0.0/8"
+# 7. 217 内网绕过配置（lan-routes.conf）
+info "7. 检查 217 内网绕过配置（lan-routes.conf）"
+LAN_CONF=$(ssh "$REMOTE_HOST" 'cat /etc/tailscale/lan-routes.conf 2>/dev/null' 2>/dev/null)
+if echo "$LAN_CONF" | grep -q "10.0.0.0/8"; then
+    pass "217 lan-routes.conf 包含 10.0.0.0/8"
 else
-    fail "217 IgnoreRoutes 配置缺失"
-    echo "  修复: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,up"
+    fail "217 lan-routes.conf 缺失"
+    echo "  修复: ./.venv/bin/ansible-playbook playbooks/deploy.yml --tags detect,lan"
 fi
 
 # 8. GitHub

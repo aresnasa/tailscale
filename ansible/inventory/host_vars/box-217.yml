@@ -9,4 +9,4 @@
 # ts_ignore_routes:
 #   - 10.9.202.0/24    # 只忽略本机直连子网
 #
-# 或在目标机写 /etc/tailscale/custom-ignore-routes.conf（一行一个 CIDR）。
+# 或在目标机写 /etc/tailscale/custom-lan-routes.conf（一行一个 CIDR）。
