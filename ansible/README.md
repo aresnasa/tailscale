@@ -92,23 +92,23 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 ./.venv/bin/ansible-playbook playbooks/deploy.yml -e ts_authkey=... --tags up          # 只执行 tailscale up
 ```
 
-## 路由忽略（fork 原生：--ignore-routes）
+## 内网绕过 table 52（lan-access）
 
-**首选方案（CIDR 级）**。本仓库 fork 给 tailscale 增加了 `--ignore-routes` 参数（上游官方版没有）：
-指定网段永远不走 Tailscale 隧道，始终用主机自身路由直连，即使在用 exit node。
+**exit node 会把 217 的全部出网流量（含内网）经 Mac 转发**。为保证 217 的内网
+（物理 LAN、Docker、K8s/CNI）不被打断，`deploy.yml` 在 `tailscale up` 后自动运行
+lan-access 步骤，用标准 `ip rule` 把内网网段绕出 table 52。此方案兼容上游官方二进制，
+无需 fork 改动。
 
 ### 自动检测（推荐）
 
-`deploy.yml` 的 `detect` 阶段会自动扫描远程节点的**物理网卡** IP，
-映射到 RFC1918 三大私有网段，无需手动维护 `ts_ignore_routes`：
+`deploy.yml` 的 `detect` 阶段会输出 RFC1918 三大私有网段（覆盖物理 LAN、Docker bridge、
+K8s pod/service、CNI 等所有内网场景），填充 `ts_ignore_routes`：
 
 ```
-物理网卡 enp1s0: 10.9.202.217/24  →  自动推导 10.0.0.0/8
-物理网卡 eth1:   192.168.1.100/24 →  自动推导 192.168.0.0/16
+10.0.0.0/8
+172.16.0.0/12
+192.168.0.0/16
 ```
-
-排除的虚拟接口：`lo`, `tailscale*`, `cilium*`, `kube-ipvs*`, `lxc*`, `docker*`,
-`br-*`, `veth*`, `virbr*`, `vnet*`, `tun*`, `tap*`, `flannel*`, `cni*`, `cali*` 等。
 
 ### 手动指定（覆盖自动检测）
 
@@ -118,29 +118,15 @@ Mac 即 Tailscale 出口节点（exit node），217 用 `--exit-node=mac-mini` �
 # 只忽略精确子网，不忽略整个 10/8
 ts_ignore_routes:
   - 10.9.202.0/24
-  - 172.16.0.0/12
 ```
+
+也可在目标机写 `/etc/tailscale/custom-lan-routes.conf`（一行一个 CIDR）精确指定。
 
 ### 原理
 
-随 `deploy.yml --tags up` 自动下发（首次 up 带参数，后续变更用 `tailscale set --ignore-routes=...` 幂等更新，无需重新登录）。
+`deploy.yml --tags up,lan` 会：
 
-**原理**（fork 源码实现，见 `net/routemanager`）：
-- 被 CIDR 覆盖的 accept-routes 子网路由直接不安装
-- exit node 的 `0.0.0.0/0` 不再整体下发，改为拆成“补集路由”写入 table 52；
-  被忽略网段在 table 52 无匹配 → 落回 main 表 → 物理网关直连
-- tailnet 自身地址（100.64/10）不受影响
-
-## 内网双向可达（lan-access）
-
-**`--ignore-routes` 的不足与补充**。调试中发现：`--ignore-routes` 只处理**出方向**路由
-（让发往内网的包走 main 表），但**入方向回包**仍会命中 `ip rule` 第 5270 条
-`from all lookup 52` → 查 table 52 → 命中 `throw <本机网段>` 或 `default dev tailscale0`
-→ 丢弃或走隧道 → **内网不可达**（外部客户端连不上本机物理 IP）。
-
-`deploy.yml --tags up` 在 `tailscale up` 后自动运行 lan-access 步骤：
-
-1. 写入 `/etc/tailscale/lan-routes.conf`（与 `ts_ignore_routes` 同一份 CIDR 列表）
+1. 写入 `/etc/tailscale/lan-routes.conf`（`ts_ignore_routes` 的 CIDR 列表）
 2. 安装 `/usr/local/sbin/tailscale-lan-rules.sh` + `tailscale-lan-rules.service`
 3. 在 `ip rule` priority **5260**（< Tailscale 5270）插入 `to <CIDR> lookup main` 规则
    → 内核在 Tailscale 规则之前命中 main 表 → 内网流量双向直连
@@ -191,8 +177,8 @@ $EDITOR playbooks/group_vars/all.yml   # 修改 ts_bypass_hosts
 即使该域名解析的 IP 落在 `ts_ignore_routes` 网段内（默认直连不走隧道），
 或之前被 bypass.yml 加入了直连白名单。
 
-公网 IP（如 `www.google.com`）不在 ignore-routes 网段内时，默认已走 exit node，
-配置 force-tunnel 可确保即使未来 ignore-routes/bypass 变更也不受影响。
+公网 IP（如 `www.google.com`）不在 `ts_ignore_routes` 网段内时，默认已走 exit node，
+配置 force-tunnel 可确保即使未来 `ts_ignore_routes`/bypass 变更也不受影响。
 
 ```sh
 # 1. 编辑白名单列表
@@ -207,49 +193,43 @@ $EDITOR playbooks/group_vars/all.yml   # 修改 ts_force_tunnel_hosts
 
 **原理**（与 bypass 对称，优先级更高）:
 - `ip rule` 优先级 **5050**（< bypass 5100 < tailscale 5270）→ `to <IP> lookup 52`
-- 对 ignore-routes 网段内的 IP，在 table 52 补 `<IP>/32 dev tailscale0` 路由
+- 对 ts_ignore_routes 网段内的 IP，在 table 52 补 `<IP>/32 dev tailscale0` 路由
   （公网 IP 已被 table 52 的 `0.0.0.0/1 + 128.0.0.0/1` 覆盖，无需补）
 - 内核在 bypass(5100) 和 tailscale(5270) 之前命中 5050 → 查 table 52 → 走 `tailscale0`
 
-优先级关系：`force-tunnel(5050) < bypass(5100) < tailscale(5270)`，三者互不冲突。
+优先级关系：`force-tunnel(5050) < bypass(5100) < lan-access(5260) < tailscale(5270)`，四者互不冲突。
 
 幂等：`/etc/tailscale-force-tunnel.conf` 追踪已管理 IP，列表变更时自动清理过期条目。
 注意：tailscaled 重启会重建 table 52，手动补的 /32 路由会丢失，需重跑此 playbook。
 
-## 透传本地代理给 tailscale exit node（fork 功能：TS_FORWARD_PROXY）
+## Mac exit node 出站走 Clash（TUN/增强模式）
 
-**问题背景**：Mac 作为 exit node（userspace-networking 模式），netstack 转发流量用标准 `net.Dialer` 直接连目标地址（源码 `wgengine/netstack/netstack.go` 的 `forwardTCP`），不走本地代理。因此当 Mac 本身无法直连目标（如 GFW 拦截 google.com）时，217 经 Mac 访问也会失败。
+**问题背景**：Mac 作为 exit node（userspace-networking 模式），netstack 转发流量用标准
+`net.Dialer` 直接连目标地址，**不吃系统代理（HTTP/SOCKS）**。因此当 Mac 本身无法直连目标
+（如 GFW 拦截 google.com）时，217 经 Mac 访问也会失败。
 
-**解决方案**：fork 给 netstack 增加了 `TS_FORWARD_PROXY` 环境变量，让 exit node 的 TCP 转发走指定的本地代理（如 Clash Verge）。
+**解决**：让 Clash Verge 开启 **TUN/增强模式**，在网络层接管 Mac 全部出站流量（含
+netstack 的转发），无需对 tailscale 代码做任何改动。`HTTP_PROXY`/`HTTPS_PROXY` 仅用于
+tailscaled 连控制面（controlplane.tailscale.com），由 `ts_control_proxy` 注入。
 
 ```yaml
-# playbooks/group_vars/all.yml
-# 支持 socks5:// 和 http:// 两种协议
-# Clash Verge 默认 mixed-port=7890（同时支持 HTTP 和 SOCKS5）
-ts_forward_proxy: "socks5://127.0.0.1:7890"
+# playbooks/group_vars/all.yml —— 仅控制面代理（上游原生支持）
+ts_control_proxy: "http://127.0.0.1:7890"
 ```
 
 ```sh
-# 1. 确保 Clash Verge 已启动且代理可用
-#    验证：curl --socks5 127.0.0.1:7890 https://www.google.com
+# 1. Clash Verge 开启 TUN/增强模式（关键：仅系统代理不够）
+#    验证：关闭系统代理后 Mac 仍能直连 https://www.google.com，即为 TUN 已接管
 
-# 2. 重新部署（重启 tailscaled 使环境变量生效）
-./.venv/bin/ansible-playbook playbooks/deploy.yml --tags deploy --limit local
+# 2. 部署
+./.venv/bin/ansible-playbook playbooks/deploy.yml --tags deploy
 
-# 3. 验证：217 经 Mac exit node -> Clash Verge 访问 google
+# 3. 验证：217 经 Mac exit node 访问 google
 ssh root@10.9.202.217 'curl -sS -o /dev/null -w "HTTP %{http_code}\n" https://www.google.com'
 ```
 
-**原理**（fork 源码 `wgengine/netstack/forwardproxy.go`）:
-- `netstack.Create` 时读 `TS_FORWARD_PROXY` 环境变量，构造代理 dialer
-- `forwardTCP` 优先用代理 dialer（socks5/http CONNECT），其次 `forwardDialFunc`（测试用），最后默认 `net.Dialer`
-- socks5 用 `golang.org/x/net/proxy`（和 `net/netns/socks.go` 同一依赖），http 用手写 CONNECT 隧道
-- 环境变量留空则不启用（默认行为不变）
-
-**限制**：
-- 仅支持 TCP 转发（exit node 的 TCP 流量），UDP 转发暂不走代理（`forwardUDP` 用 `net.ListenUDP`）
-- 仅对 exit node（Mac）生效，客户端无需配置
-- 改变代理地址需重启 tailscaled（launchd 重载 plist 生效）
+**注意**：若只用 Clash 的系统代理（HTTP/SOCKS），netstack 转发流量不会走代理，
+被墙站点会失败。务必开启 TUN/增强模式。
 
 ## 重置节点（清空状态、重新开始）
 
