@@ -9,13 +9,13 @@
 | mac-mini（本机） | localhost | **exit node**（出口网关） | darwin/arm64 | `dist/*-darwin-arm64` | 用户级 LaunchAgent（非 root，userspace-networking） |
 | box-217（远端） | 10.9.202.217 (root) | **exit node client**（经 Mac 出网） | linux/amd64 | `dist/*-linux-amd64` | systemd (`tailscaled.service`) |
 
-**拓扑意图**：217 的出网流量经 Tailscale 隧道送到 Mac，由 Mac 通过 Clash Verge 代理转发到公网。
+**拓扑意图**：217 的出网流量经 Tailscale 隧道送到 Mac，由 Mac 通过 Clash Verge（TUN/增强模式）转发到公网。
 
 ```mermaid
 graph LR
     A["box-217 (Linux)<br/>10.9.202.217"] -->|"Tailscale 隧道"| B["mac-mini (macOS)<br/>exit node"]
-    B -->|"TS_FORWARD_PROXY<br/>Clash Verge 7890"| C["公网<br/>GitHub / Google"]
-    A -.->|"ignore-routes<br/>内网直连"| D["内网<br/>10.9.202.0/24"]
+    B -->|"Clash TUN<br/>增强模式"| C["公网<br/>GitHub / Google"]
+    A -.->|"lan-access<br/>内网直连"| D["内网<br/>10.9.202.0/24"]
 ```
 
 ---
@@ -30,8 +30,9 @@ graph LR
 
 2. 远端 `10.9.202.217` 可免密 SSH（root）。
 
-3. **Mac 上 Clash Verge 已启动**，监听 `127.0.0.1:7890`（HTTP 代理）。
-   验证：`curl -x http://127.0.0.1:7890 https://github.com` 返回 200。
+3. **Mac 上 Clash Verge 已启动并开启 TUN/增强模式**（关键：仅系统代理不够，
+   netstack 转发不走系统代理）。验证：关闭系统代理后 Mac 仍能直连
+   `https://www.google.com`，即为 TUN 已接管。
 
 4. **Mac 上 Tailscale GUI 客户端已退出**（避免抢占端口/接口）。
 
@@ -52,7 +53,7 @@ cd ansible
 **做什么**：
 - 交叉编译 `tailscale` + `tailscaled`（darwin/arm64 + linux/amd64）
 - 分发二进制到 Mac (`~/.tailscale/bin/`) 和 217 (`/usr/local/bin/`)
-- 生成 `tailscaled.env`（含 `TS_FORWARD_PROXY` + `HTTP_PROXY`）
+- 生成 `tailscaled.env`（含 `HTTP_PROXY`/`HTTPS_PROXY`，仅用于连控制面）
 - 安装 daemon（Mac: LaunchAgent / 217: systemd）并启动
 - 等待 daemon 就绪
 
@@ -67,8 +68,8 @@ cd ansible
 **做什么**：
 - 自动检测 RFC1918 三大私有网段（`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`）
 - Mac: `tailscale up --advertise-exit-node`（广播出口节点）
-- 217: `tailscale up --exit-node=<Mac-IP> --ignore-routes=... --exit-node-allow-lan-access`
-- 设置 `--ignore-routes`（内网不走隧道）
+- 217: `tailscale up --exit-node=<Mac-IP> --exit-node-allow-lan-access`
+- 内网不走隧道（lan-access ip rule 5260）
 - 安装 `tailscale-lan-rules.service`（ip rule 5260，绕过 table 52 的 throw）
 
 **如果节点未登录**：
