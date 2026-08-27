@@ -29,21 +29,10 @@ ts_interactive: false
 # 追加给 tailscale up 的额外参数（如 --advertise-exit-node 之外的需求）
 ts_up_extra_args: ""
 
-# ---- 透传本地代理给 tailscale exit node（fork 功能：TS_FORWARD_PROXY）----
-# Mac 作为 exit node 时，默认用 net.Dialer 直连转发，不走本地代理。
-# 设置此变量后，exit node 的转发流量经指定代理出网（如 Clash Verge）。
-# 支持 socks5://host:port 和 http://host:port 两种协议。
-# 留空则不启用（默认行为，直接转发）。
-# 仅对 exit node（Mac）生效；客户端无需配置。
-# 示例:
-#   ts_forward_proxy: "socks5://127.0.0.1:7891"   # Clash Verge SOCKS5
-#   ts_forward_proxy: "http://127.0.0.1:7890"      # Clash Verge HTTP
-ts_forward_proxy: "http://127.0.0.1:7890"
-
 # ---- tailscaled 自身访问控制面的代理（HTTP_PROXY/HTTPS_PROXY）----
-# TS_FORWARD_PROXY 只对 exit node 转发流量生效，不影响 tailscaled 连控制面
-# （controlplane.tailscale.com）。如果 Mac 本身无法直连控制面（如 GFW 拦截），
-# 需要单独设置此变量，让 tailscaled 的控制面连接也走代理。
+# exit node 的转发流量不再走本地代理（改用 Clash TUN/增强模式在系统层接管）。
+# 但 tailscaled 连控制面（controlplane.tailscale.com）在 GFW 环境仍需走代理，
+# 因此保留 HTTP_PROXY/HTTPS_PROXY（上游原生支持，无需改代码）。
 # 仅对 Mac（exit node）生效；Linux 客户端通常能直连控制面。
 # 留空则 tailscaled 直连控制面（默认行为）。
 ts_control_proxy: "http://127.0.0.1:7890"
@@ -63,13 +52,10 @@ test_urls:
 # exit-node-client 引用的对端 tailscale 主机名（默认即 mac-mini）
 ts_exit_node: "mac-mini"
 
-# ---- 直连白名单（不走 exit node 隧道，直接从本机出网）----
-# ---- 路由忽略（fork 原生功能：--ignore-routes）----
-# 这些 CIDR 永远不走 Tailscale 隧道，始终用主机自身的路由（物理网关直连）：
-#   - 被 CIDR 完全覆盖的 accept-routes 子网路由不会被接受
-#   - exit node 的 0.0.0.0/0 拆成“补集路由”下发（table 52），被忽略网段落到 main 表直连
-#   - Tailscale 自身地址（100.64/10）不受影响，tailnet 互通不中断
-# 需要本仓库构建的二进制（上游官方版无此参数）；在每个主机上按需覆盖。
+# ---- 内网网段（exit node 场景下绕过 table 52）----
+# 这些 CIDR 不走 Tailscale 隧道，始终用主机自身的路由（物理网关直连），
+# 保证 217 用 Mac 做 exit node 时内网（物理 LAN、Docker、K8s/CNI）仍可达。
+# 纯 ip rule 方案，兼容上游官方二进制，无需 fork 改动。
 #
 # 自动检测：deploy.yml 的 detect 阶段默认输出 RFC1918 三大私有网段：
 #   10.0.0.0/8、172.16.0.0/12、192.168.0.0/16
@@ -77,10 +63,8 @@ ts_exit_node: "mac-mini"
 # 在 host_vars 手动设置 ts_ignore_routes 则覆盖自动检测。
 # 也可在目标机写 /etc/tailscale/custom-ignore-routes.conf 精确指定网段。
 #
-# 注意：--ignore-routes 只处理出方向路由，入方向回包仍会命中 table 52 的 throw/default
-# 导致内网不可达。deploy.yml 会在 tailscale up 后自动运行 lan-access 步骤，
-# 在 ip rule priority 5260（< Tailscale 5270）插入 to <CIDR> lookup main 规则，
-# 让内网网段双向都走 main 表，绕过 table 52。详见 README.md "内网双向可达" 章节。
+# deploy.yml 会在 tailscale up 后运行 lan-access 步骤，在 ip rule priority 5260
+# （< Tailscale 5270）插入 to <CIDR> lookup main 规则，让内网网段双向走 main 表。
 ts_ignore_routes: []
 #  - 10.0.0.0/8
 #  - 192.168.0.0/16

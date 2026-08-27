@@ -3,14 +3,13 @@
 #
 # 问题背景:
 #   tailscale up --exit-node 后，ip rule 第 5270 条 from all lookup 52 让所有流量
-#   先查 table 52。table 52 里有 exit node 的补集路由（指向 tailscale0），
-#   以及对本机直连网段的 throw 规则。--ignore-routes 让出方向内网走 main 表，
-#   但入方向回包仍命中 table 52 的 throw/default → 丢弃或走隧道 → 内网不可达。
+#   先查 table 52。table 52 里有 exit node 的路由（指向 tailscale0），
+#   内网流量会被吸进隧道，导致内网不可达。
 #
 # 解法:
 #   在 5270 之前（priority 5260）插入 to <CIDR> lookup main 规则，
 #   让目标在内网段的流量直接查 main 表，绕过 table 52。
-#   规则来源：ts_ignore_routes（fork 的 --ignore-routes 同一份 CIDR 列表）。
+#   规则来源：ts_ignore_routes（RFC1918 三大私有网段列表）。
 #
 # 幂等：规则重复添加会被 grep 跳过；CIDR 列表变化时更新配置文件后重载服务。
 # 持久化：systemd service 在 tailscaled 之后启动，重启自动恢复 ip rule。
@@ -39,7 +38,6 @@
         content: |
           # 内网网段列表（由 ansible lan-access.yml 生成）
           # 这些 CIDR 的流量绕过 Tailscale table 52，直接走 main 表
-          # 与 tailscale up --ignore-routes 使用同一份列表
           {% for cidr in ts_ignore_routes | default([]) %}
           {{ cidr }}
           {% endfor %}

@@ -56,13 +56,19 @@
         mode: "0755"
 
   tasks:
-    - name: make build（darwin/arm64 + linux/amd64）
-      ansible.builtin.command:
-        cmd: "{{ item }}"
+    - name: 交叉编译 tailscale + tailscaled（darwin/arm64 + linux/amd64）
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          for pkg in tailscale.com/cmd/tailscale tailscale.com/cmd/tailscaled; do
+            bin="$(basename "$pkg")"
+            CGO_ENABLED=0 GOOS={{ item.goos }} GOARCH={{ item.goarch }} \
+              ./build_dist.sh -o "dist/${bin}-{{ item.goos }}-{{ item.goarch }}" "$pkg"
+          done
         chdir: "{{ playbook_dir }}/../.."
       loop:
-        - make build GOOS=darwin GOARCH=arm64
-        - make build GOOS=linux GOARCH=amd64
+        - { goos: darwin, goarch: arm64 }
+        - { goos: linux, goarch: amd64 }
       register: build_result
       changed_when: true
       failed_when: build_result.rc != 0
@@ -249,8 +255,6 @@
           --hostname={{ inventory_hostname }}
           {% if ts_role == 'exit-node' %}--advertise-exit-node
           {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes --exit-node-allow-lan-access
-          {% endif %}
-          {% if ts_ignore_routes | default([]) | length > 0 %}--ignore-routes={{ ts_ignore_routes | join(',') }}
           {% endif %}
           {{ ts_up_extra_args }}
 
@@ -456,8 +460,6 @@
           {% if ts_role == 'exit-node' %}--advertise-exit-node
           {% elif ts_role == 'exit-node-client' %}--exit-node={{ ts_exit_node }} --accept-routes --exit-node-allow-lan-access
           {% endif %}
-          {% if ts_ignore_routes | default([]) | length > 0 %}--ignore-routes={{ ts_ignore_routes | join(',') }}
-          {% endif %}
           {{ ts_up_extra_args }}
       when: ts_exit_node_resolved | default(false)
 
@@ -577,25 +579,17 @@
         - "'Logged out' not in (client_status.stdout | default(''))"
 
 # ═══════════════════════════════════════════════════════════════
-# 阶段 3d: 应用路由忽略配置 + 内网绕过 table 52
+# 阶段 3d: 确保不接管本地 DNS + 内网绕过 table 52
 # ═══════════════════════════════════════════════════════════════
-- name: 应用路由忽略配置（幂等）
+- name: 确保不接管本地 DNS（幂等）
   hosts: all
   become: "{{ ts_become | bool }}"
   gather_facts: false
   tags: [up, lan]
   tasks:
-    - name: tailscale set --ignore-routes
+    - name: tailscale set --accept-dns=false（不修改系统 DNS）
       ansible.builtin.command:
-        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} set --ignore-routes={{ ts_ignore_routes | join(',') }}"
-      when: ts_ignore_routes | default([]) | length > 0
-      register: set_ignore
-      changed_when: set_ignore.rc | default(1) == 0
-      failed_when: false
-
-    - name: tailscale set --accept-dns（用默认 DNS 模式，幂等）
-      ansible.builtin.command:
-        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} set --accept-dns=true"
+        cmd: "{{ ts_install_dir }}/tailscale --socket={{ ts_socket }} set --accept-dns=false"
       register: set_dns
       changed_when: set_dns.rc | default(1) == 0
       failed_when: false
@@ -604,15 +598,15 @@
       ansible.builtin.debug:
         msg:
           - "{{ inventory_hostname }}:"
-          - "  set --ignore-routes rc={{ set_ignore.rc | default('skipped') }}"
           - "  set --accept-dns rc={{ set_dns.rc | default('skipped') }}"
-          - "{{ set_ignore.stderr_lines | default(set_dns.stderr_lines | default([])) }}"
+          - "{{ set_dns.stderr_lines | default([]) }}"
           - ">> 若 daemon 未部署/未登录，先跑 --tags install 或带 ts_authkey 的 up。"
-      when: (set_ignore.rc | default(0)) != 0 or (set_dns.rc | default(0)) != 0
+      when: (set_dns.rc | default(0)) != 0
 
 - name: 配置内网绕过 table 52（ip rule 5260）
-  # --ignore-routes 只处理出方向，入方向回包仍命中 table 52 的 throw/default。
-  # 在 ip rule priority 5260（< Tailscale 5270）插 to <CIDR> lookup main 规则。
+  # tailscale up --exit-node 后，table 52 会把内网流量也吸进隧道。
+  # 在 ip rule priority 5260（< Tailscale 5270）插 to <CIDR> lookup main 规则，
+  # 让内网网段直接走 main 表，保证内网可达。
   hosts: remote
   become: true
   gather_facts: false
@@ -630,7 +624,6 @@
         content: |
           # 内网网段列表（由 ansible deploy.yml 生成）
           # 这些 CIDR 的流量绕过 Tailscale table 52，直接走 main 表
-          # 与 tailscale up --ignore-routes 使用同一份列表
           {% for cidr in ts_ignore_routes | default([]) %}
           {{ cidr }}
           {% endfor %}
@@ -837,7 +830,7 @@
           {% set ok = curl_results.results | selectattr('rc', 'equalto', 0) | list %}
           汇总: {{ ok | length }}/{{ curl_results.results | length }} 成功
           若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。
-          若 google 等被墙站点失败：确认 Mac 已配置 ts_forward_proxy 指向 Clash Verge。
+          若 google 等被墙站点失败：确认 Mac 上的 Clash 已开启 TUN/增强模式（接管全部出站流量）。
 
 # ═══════════════════════════════════════════════════════════════
 # 部署总结

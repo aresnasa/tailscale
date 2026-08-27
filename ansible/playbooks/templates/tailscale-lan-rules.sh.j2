@@ -3,9 +3,8 @@
 #
 # 问题背景:
 #   tailscale up --exit-node 后，Tailscale 在 ip rule 里加 5270: from all lookup 52,
-#   在 table 52 里写 default dev tailscale0（exit node 路由补集）。
-#   --ignore-routes 让出方向 10.x 不走 table 52，但入方向回包（目的地在内网段）
-#   仍会命中 table 52 的 throw 或 default，导致连接进得来、回不去。
+#   在 table 52 里写 default dev tailscale0（exit node 路由）。
+#   内网流量（出方向）会命中 table 52 被吸进隧道，导致内网不可达。
 #
 # 解法:
 #   在 5270 之前（priority 5260）插入 to <CIDR> lookup main 规则,

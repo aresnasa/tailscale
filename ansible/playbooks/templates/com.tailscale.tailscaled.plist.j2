@@ -2,12 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Mac 用户级 LaunchAgent：非 root，tailscaled 用 --tun=userspace-networking -->
 <!-- 仍支持 exit node：darwin 上子网/出口转发走 netstack 用户态并自带 NAT -->
-{% if ts_forward_proxy is defined and ts_forward_proxy | length > 0 -%}
-<!-- 透传本地代理（如 Clash Verge）给 tailscale exit node 转发流量（TS_FORWARD_PROXY）-->
-{% endif -%}
+<!-- exit node 的转发流量请用 Clash TUN/增强模式在系统层接管 -->
 {% if ts_control_proxy is defined and ts_control_proxy | length > 0 -%}
 <!-- tailscaled 自身访问控制面（controlplane.tailscale.com）走的代理（HTTP_PROXY/HTTPS_PROXY）-->
-<!-- TS_FORWARD_PROXY 只对 exit node 转发流量生效，不影响 tailscaled 连控制面 -->
 {% endif -%}
 <plist version="1.0">
 <dict>
@@ -21,8 +18,6 @@
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>TS_FORWARD_PROXY</key>
-		<string>{{ ts_forward_proxy | default('') }}</string>
 		{% if ts_control_proxy is defined and ts_control_proxy | length > 0 %}
 		<key>HTTP_PROXY</key>
 		<string>{{ ts_control_proxy }}</string>

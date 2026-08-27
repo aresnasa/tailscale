@@ -93,7 +93,7 @@
           {% set ok = curl_results.results | selectattr('rc', 'equalto', 0) | list %}
           汇总: {{ ok | length }}/{{ curl_results.results | length }} 成功
           若失败：确认 Mac 已 up --advertise-exit-node 且管理后台已审批 exit node。
-          若 google 等被墙站点失败：确认 Mac 已配置 ts_forward_proxy 指向 Clash Verge。
+          若 google 等被墙站点失败：确认 Mac 上的 Clash 已开启 TUN/增强模式（接管全部出站流量）。
 
 - name: 验证 217 内网双向可达（exit node 不破坏内网访问）
   hosts: remote
@@ -194,5 +194,5 @@
             Mac tailnet IP 为空 → Mac 未登录，重跑 deploy.yml --tags up
             tailscale ping 失败 → 两机未 join 同 tailnet 或被 ACL 拦截
             mesh 走 DERP 而非 direct → 不是错误，多数跨地域场景都走 DERP 中转
-            外网全失败 → 管理后台未审批 exit node，或未配 ts_forward_proxy
+            外网全失败 → 管理后台未审批 exit node，或 Mac 上 Clash 未开 TUN/增强模式
           ══════════════════════════════════════════════════════════
